@@ -95,13 +95,6 @@ impl ApiError {
             "This file cannot be previewed",
         )
     }
-    pub fn version_required() -> ApiError {
-        Self::new(
-            StatusCode::PRECONDITION_REQUIRED,
-            "version-required",
-            "Writing bytes needs If-Match or If-None-Match",
-        )
-    }
     pub fn storage_unavailable(d: impl Into<String>) -> ApiError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

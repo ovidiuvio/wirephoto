@@ -149,31 +149,19 @@ impl LibFs {
         Ok((tmp, f.into_std()))
     }
 
-    /// Makes a finished temporary file visible as `final_rel`, failing if that name exists. Uses a hard link
-    /// (atomic, never replaces); where the filesystem has none, checks then renames.
+    /// Makes a finished temporary file visible as `final_rel`, failing with `AlreadyExists` if that name
+    /// exists, in which case the temporary file is left for the caller to try another name or remove. Never
+    /// replaces: a hard link where the filesystem has them, else a rename that refuses to replace
+    /// ([`Self::rename_new`]).
     pub fn publish_new(&self, tmp: &str, final_rel: &str) -> io::Result<()> {
         match self.dir.hard_link(p(tmp), &self.dir, p(final_rel)) {
             Ok(()) => {
                 let _ = self.dir.remove_file(p(tmp));
                 Ok(())
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let _ = self.dir.remove_file(p(tmp));
-                Err(e)
-            }
-            Err(_) => {
-                if self.exists(final_rel) {
-                    let _ = self.dir.remove_file(p(tmp));
-                    return Err(io::ErrorKind::AlreadyExists.into());
-                }
-                self.dir.rename(p(tmp), &self.dir, p(final_rel))
-            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+            Err(_) => self.rename_new(tmp, final_rel),
         }
-    }
-
-    /// Atomically replaces `final_rel` with a finished temporary file.
-    pub fn publish_replace(&self, tmp: &str, final_rel: &str) -> io::Result<()> {
-        self.dir.rename(p(tmp), &self.dir, p(final_rel))
     }
 
     pub fn remove_file(&self, rel: &str) -> io::Result<()> {
@@ -197,8 +185,30 @@ impl LibFs {
         self.dir.create_dir_all(p(rel))
     }
 
-    /// Renames within the library, failing if the target exists.
+    /// Renames within the library, failing with `AlreadyExists` if the target exists. The filesystem itself
+    /// refuses to replace (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS), so a
+    /// file arriving at `to` meanwhile is never overwritten. The parents are opened through the confined root
+    /// and only the final names are passed. Where the filesystem cannot (some network mounts), it checks first.
     pub fn rename_new(&self, from: &str, to: &str) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use rustix::fs::{RenameFlags, renameat_with};
+            use rustix::io::Errno;
+            let from_dir = self.dir.open_dir(p(parent_of(from)))?;
+            let to_dir = self.dir.open_dir(p(parent_of(to)))?;
+            match renameat_with(
+                &from_dir,
+                name_of(from),
+                &to_dir,
+                name_of(to),
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(Errno::EXIST) => return Err(io::ErrorKind::AlreadyExists.into()),
+                Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         if self.exists(to) {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
@@ -222,7 +232,17 @@ impl LibFs {
             }
             Ok(())
         } else {
-            self.dir.copy(p(from), &dest.dir, p(to)).map(|_| ())
+            // Into a temporary file, then published without replacing anything.
+            let (tmp, file) = dest.create_temp(to)?;
+            drop(file);
+            let res = self
+                .dir
+                .copy(p(from), &dest.dir, p(&tmp))
+                .and_then(|_| dest.publish_new(&tmp, to));
+            if res.is_err() {
+                let _ = dest.dir.remove_file(p(&tmp));
+            }
+            res
         }
     }
 
@@ -242,6 +262,37 @@ pub fn write_all_sync(f: &mut std::fs::File, data: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renames_and_publishes_never_replace() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("lib");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/x"), b"x").unwrap();
+        std::fs::write(root.join("a/y"), b"y").unwrap();
+        let fs = LibFs::open(&root).unwrap();
+        let e = fs.rename_new("a/x", "a/y").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(root.join("a/y")).unwrap(), b"y");
+        fs.rename_new("a/x", "z").unwrap();
+        assert_eq!(std::fs::read(root.join("z")).unwrap(), b"x");
+        let (tmp, mut f) = fs.create_temp("a/y").unwrap();
+        write_all_sync(&mut f, b"new").unwrap();
+        assert_eq!(
+            fs.publish_new(&tmp, "a/y").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(fs.exists(&tmp), "kept for another name");
+        fs.publish_new(&tmp, "a/y-1").unwrap();
+        assert_eq!(std::fs::read(root.join("a/y")).unwrap(), b"y");
+        assert_eq!(std::fs::read(root.join("a/y-1")).unwrap(), b"new");
+        assert_eq!(
+            fs.copy_to("a/y-1", &fs, "a/y").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs.copy_to("a/y-1", &fs, "a/y-2").unwrap();
+        assert_eq!(std::fs::read(root.join("a/y-2")).unwrap(), b"new");
+    }
 
     #[test]
     fn names() {

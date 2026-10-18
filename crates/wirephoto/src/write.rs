@@ -155,7 +155,78 @@ fn pregenerate(app: &Arc<App>, entry_id: String, src: preview::Source) {
     });
 }
 
-/// `PUT /v1/entries/{folder}/children/{name}`
+/// How many names are tried after a taken one (`name-1` … `name-9999`).
+const MAX_NAMES: u32 = 10_000;
+
+/// The `n`th name for `name` when it is taken: `IMG_1.jpg` -> `IMG_1-1.jpg`, `IMG_1-2.jpg`…; a folder, or a
+/// file without an extension, gets the number at the end. `n = 0` is `name` itself.
+pub fn nth_name(name: &str, n: u32, folder: bool) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    match name.rfind('.').filter(|&i| i > 0 && !folder) {
+        Some(i) => format!("{}-{n}{}", &name[..i], &name[i..]),
+        None => format!("{name}-{n}"),
+    }
+}
+
+/// Runs `op` with `name` in `parent`, then with the next names while it fails because the name is taken:
+/// (path, name) of the one that worked. `op` must fail atomically on a taken name (never replace).
+fn first_free(
+    parent: &str,
+    name: &str,
+    folder: bool,
+    mut op: impl FnMut(&str) -> std::io::Result<()>,
+) -> ApiResult<(String, String)> {
+    for n in 0..MAX_NAMES {
+        let candidate = nth_name(name, n, folder);
+        let rel = fsx::join(parent, &candidate);
+        match op(&rel) {
+            Ok(()) => return Ok((rel, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict("no free name left for it"))
+}
+
+/// A file in `folder` with exactly these bytes. Files of the same size not hashed yet are hashed now, so the
+/// check cannot miss one.
+fn same_content(
+    app: &App,
+    folder: &EntryRow,
+    size: u64,
+    sha: &[u8; 32],
+) -> ApiResult<Option<EntryRow>> {
+    let rows: Vec<EntryRow> = app.db.read(|c| {
+        let mut st = c.prepare(&format!(
+            "SELECT {} FROM {} WHERE e.parent = ? AND e.size = ? AND e.kind != 0 AND e.trashed_at IS NULL AND e.missing = 0",
+            db::ENTRY_COLS,
+            db::ENTRY_FROM
+        ))?;
+        let rows = st
+            .query_map(params![folder.rowid, size as i64], EntryRow::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })?;
+    for row in rows {
+        let hash = match row.sha256.as_deref() {
+            Some(h) => h.to_vec(),
+            None => match indexer::hash_entry(app, &row) {
+                Ok(Some(h)) => h.to_vec(),
+                _ => continue,
+            },
+        };
+        if hash == sha[..] {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// `PUT /v1/entries/{folder}/children/{name}`: a new file. Never refused for its name and never overwrites:
+/// if the folder already has a file with these exact bytes, nothing is stored and that file is the answer
+/// (`200`); otherwise the file is stored under `name`, or the first free `name-N` if it is taken (`201`).
 pub async fn put_child(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
@@ -163,28 +234,57 @@ pub async fn put_child(
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<Response> {
-    if header_tag(&headers, header::IF_NONE_MATCH).as_deref() != Some("*") {
-        return Err(ApiError::version_required().detail("creating a file needs If-None-Match: *"));
-    }
     if !fsx::valid_name(&name) {
         return Err(ApiError::invalid("not a valid file name"));
     }
-    let digest = content_digest(&headers)?;
     let a = app.clone();
     let k = key.clone();
     let parent =
         tokio::task::spawn_blocking(move || a.db.read(|c| Ok(load(c, &k, &folder)))).await???;
+    save_new(app, key, parent, name, headers, body).await
+}
+
+/// `PUT /v1/entries/{id}/content`: new contents for a file, saved as a NEW file beside it (the original is
+/// never overwritten): the same as `PUT` into its folder under its name, so identical bytes store nothing and
+/// different ones become `name-N`.
+pub async fn put_content(
+    State(app): State<Arc<App>>,
+    Caller(key): Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    let a = app.clone();
+    let k = key.clone();
+    let (row, parent) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+        let row = a.db.read(|c| Ok(load(c, &k, &id)))??;
+        if row.kind == Kind::Folder || row.is_trashed() {
+            return Err(ApiError::invalid("not a file"));
+        }
+        let parent =
+            a.db.read(|c| Ok(db::entry_by_rowid(c, row.parent.unwrap_or(0))?))?
+                .ok_or_else(ApiError::internal)?;
+        Ok((row, parent))
+    })
+    .await??;
+    save_new(app, key, parent, row.name, headers, body).await
+}
+
+async fn save_new(
+    app: Arc<App>,
+    key: crate::auth::KeyRow,
+    parent: EntryRow,
+    name: String,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
     if parent.kind != Kind::Folder || parent.is_trashed() {
         return Err(ApiError::invalid("parent is not a folder"));
     }
+    let digest = content_digest(&headers)?;
     let lib = writable(&app, &key, &parent)?;
-    let rel = fsx::join(&parent.path, &name);
-    let taken = |lib: &Library| lib.fs.exists(&rel);
-    if taken(&lib) {
-        return Err(ApiError::version_mismatch("the name is taken"));
-    }
-
-    let (tmp, sha, kept) = receive(&lib, &rel, body).await?;
+    let wanted = fsx::join(&parent.path, &name);
+    let (tmp, sha, kept) = receive(&lib, &wanted, body).await?;
     if digest.is_some_and(|d| d != sha) {
         let _ = lib.fs.remove_file(&tmp);
         return Err(ApiError::digest_mismatch());
@@ -193,15 +293,27 @@ pub async fn put_child(
     let lib2 = lib.clone();
     let kept = kept.map(Arc::new);
     let kept2 = kept.clone();
-    let (entry, id) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+    let key2 = key.clone();
+    let (entry, id, created) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+        let key = key2;
         let _guard = lib2.lock.blocking_lock();
-        match lib2.fs.publish_new(&tmp, &rel) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(ApiError::version_mismatch("the name is taken"));
-            }
-            Err(e) => return Err(e.into()),
+        let size = lib2.fs.stat(&tmp)?.map_or(0, |s| s.size);
+        // Already there: nothing to store.
+        if let Some(existing) = same_content(&a, &parent, size, &sha)? {
+            let _ = lib2.fs.remove_file(&tmp);
+            let entry = a.db.read(|c| Ok(to_api(&a, c, &existing, &key)?))?;
+            return Ok((entry, existing.id, false));
         }
+        let published = first_free(&parent.path, &name, false, |rel| {
+            lib2.fs.publish_new(&tmp, rel)
+        });
+        let (rel, name) = match published {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = lib2.fs.remove_file(&tmp);
+                return Err(e);
+            }
+        };
         lib2.fs.fsync_dir(&parent.path);
         let st = lib2.fs.stat(&rel)?.ok_or_else(ApiError::internal)?;
         let facts = facts_for(&a, &lib2, &rel, &name, kept2.as_deref());
@@ -236,9 +348,12 @@ pub async fn put_child(
             db::entry_by_rowid(t, rowid)?.ok_or_else(|| anyhow::anyhow!("vanished"))
         })?;
         let entry = a.db.read(|c| Ok(to_api(&a, c, &row, &key)?))?;
-        Ok((entry, row.id))
+        Ok((entry, row.id, true))
     })
     .await??;
+    if !created {
+        return Ok(entry_response(entry));
+    }
     // Bytes in memory reach a decoder through a pipe, which ffmpeg cannot seek: videos are read from the file.
     let src = match kept {
         Some(b) if entry.kind != Kind::Video => preview::Source::Bytes(b),
@@ -254,85 +369,6 @@ pub async fn put_child(
     r.headers_mut()
         .insert(header::LOCATION, location.parse().unwrap());
     Ok(r)
-}
-
-/// `PUT /v1/entries/{id}/content`
-pub async fn put_content(
-    State(app): State<Arc<App>>,
-    Caller(key): Caller,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    body: Body,
-) -> ApiResult<Response> {
-    let Some(tag) = header_tag(&headers, header::IF_MATCH) else {
-        return Err(ApiError::version_required().detail("replacing a file needs If-Match"));
-    };
-    let digest = content_digest(&headers)?;
-    let a = app.clone();
-    let k = key.clone();
-    let row = tokio::task::spawn_blocking(move || a.db.read(|c| Ok(load(c, &k, &id)))).await???;
-    if row.kind == Kind::Folder || row.is_trashed() {
-        return Err(ApiError::invalid("not a file"));
-    }
-    let lib = writable(&app, &key, &row)?;
-    if tag != row.etag() {
-        return Err(ApiError::version_mismatch(format!(
-            "If-Match {tag}, current {}",
-            row.etag()
-        )));
-    }
-    let (tmp, sha, kept) = receive(&lib, &row.path, body).await?;
-    if digest.is_some_and(|d| d != sha) {
-        let _ = lib.fs.remove_file(&tmp);
-        return Err(ApiError::digest_mismatch());
-    }
-    let a = app.clone();
-    let lib2 = lib.clone();
-    let kept = kept.map(Arc::new);
-    let kept2 = kept.clone();
-    let entry = tokio::task::spawn_blocking(move || -> ApiResult<_> {
-        let _guard = lib2.lock.blocking_lock();
-        // Check again under the lock: someone may have replaced it meanwhile.
-        let current =
-            a.db.read(|c| Ok(db::entry_by_rowid(c, row.rowid)?))?
-                .ok_or_else(ApiError::not_found)?;
-        if current.etag() != tag {
-            let _ = lib2.fs.remove_file(&tmp);
-            return Err(ApiError::version_mismatch(format!(
-                "If-Match {tag}, current {}",
-                current.etag()
-            )));
-        }
-        lib2.fs.publish_replace(&tmp, &current.path)?;
-        let st = lib2
-            .fs
-            .stat(&current.path)?
-            .ok_or_else(ApiError::internal)?;
-        let facts = facts_for(&a, &lib2, &current.path, &current.name, kept2.as_deref());
-        let row = a.write(|t| {
-            db::update_file_stat(t, current.rowid, st.size, st.mtime_ns, st.dev, st.ino)?;
-            t.execute(
-                "UPDATE entries SET sha256 = ? WHERE rowid = ?",
-                params![&sha[..], current.rowid],
-            )?;
-            let row =
-                db::entry_by_rowid(t, current.rowid)?.ok_or_else(|| anyhow::anyhow!("vanished"))?;
-            indexer::store_facts(t, &row, facts.as_ref(), true)?;
-            db::entry_by_rowid(t, current.rowid)?.ok_or_else(|| anyhow::anyhow!("vanished"))
-        })?;
-        Ok(a.db.read(|c| Ok(to_api(&a, c, &row, &key)?))?)
-    })
-    .await??;
-    // Bytes in memory reach a decoder through a pipe, which ffmpeg cannot seek: videos are read from the file.
-    let src = match kept {
-        Some(b) if entry.kind != Kind::Video => preview::Source::Bytes(b),
-        _ => preview::Source::File(
-            lib.fs.clone(),
-            entry.path.trim_start_matches('/').to_string(),
-        ),
-    };
-    pregenerate(&app, entry.id.clone(), src);
-    Ok(entry_response(entry))
 }
 
 /// `POST /v1/entries`: a folder or a copy.
@@ -373,15 +409,9 @@ fn create(
             if !fsx::valid_name(&name) {
                 return Err(ApiError::invalid("not a valid folder name"));
             }
-            let rel = fsx::join(&parent.path, &name);
             let _guard = lib.lock.blocking_lock();
-            match lib.fs.create_dir(&rel) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(ApiError::conflict("the name is taken"));
-                }
-                Err(e) => return Err(e.into()),
-            }
+            // A taken name gets the next free one (`Selects-1`).
+            let (rel, name) = first_free(&parent.path, &name, true, |rel| lib.fs.create_dir(rel))?;
             let st = lib.fs.stat(&rel)?.ok_or_else(ApiError::internal)?;
             app.write(|t| {
                 if let Some(existing) = db::entry_by_path(t, &lib.api_id, &rel)? {
@@ -419,7 +449,6 @@ fn create(
             if !fsx::valid_name(&name) {
                 return Err(ApiError::invalid("not a valid name"));
             }
-            let rel = fsx::join(&parent.path, &name);
             if src.kind == Kind::Folder
                 && src.library == lib.api_id
                 && (parent.path == src.path || parent.path.starts_with(&format!("{}/", src.path)))
@@ -428,14 +457,10 @@ fn create(
             }
             let row = {
                 let _guard = lib.lock.blocking_lock();
-                src_lib
-                    .fs
-                    .copy_to(&src.path, &lib.fs, &rel)
-                    .map_err(|e| match e.kind() {
-                        std::io::ErrorKind::AlreadyExists => {
-                            ApiError::conflict("the name is taken")
-                        }
-                        _ => ApiError::from(e),
+                // A copy is a deliberate duplicate: no dedup, a taken name gets the next free one.
+                let (rel, name) =
+                    first_free(&parent.path, &name, src.kind == Kind::Folder, |rel| {
+                        src_lib.fs.copy_to(&src.path, &lib.fs, rel)
                     })?;
                 let st = lib.fs.stat(&rel)?.ok_or_else(ApiError::internal)?;
                 app.write(|t| {
@@ -579,21 +604,35 @@ fn rename(
         return Ok(row.clone());
     }
     let _guard = lib.lock.blocking_lock();
-    // A case-only rename on a case-insensitive filesystem "exists" already; let rename handle it.
+    // A case-only rename: on a case-insensitive filesystem the new name "exists" already (it is this entry), so
+    // it goes through a temporary name.
     let case_only = new_rel.eq_ignore_ascii_case(&row.path);
-    if !case_only && lib.fs.exists(&new_rel) {
-        return Err(ApiError::conflict("the name is taken"));
-    }
-    if case_only {
+    let from = if case_only {
         let tmp = fsx::join(
             fsx::parent_of(&row.path),
             &format!(".wp-{}.tmp", util::random_id("")),
         );
         lib.fs.rename_new(&row.path, &tmp)?;
-        lib.fs.rename_new(&tmp, &new_rel)?;
+        tmp
     } else {
-        lib.fs.rename_new(&row.path, &new_rel)?;
-    }
+        row.path.clone()
+    };
+    // A taken name gets the next free one; nothing is replaced.
+    let moved = first_free(
+        &new_parent.path,
+        &new_name,
+        row.kind == Kind::Folder,
+        |rel| lib.fs.rename_new(&from, rel),
+    );
+    let (new_rel, new_name) = match moved {
+        Ok(v) => v,
+        Err(e) => {
+            if case_only {
+                let _ = lib.fs.rename_new(&from, &row.path);
+            }
+            return Err(e);
+        }
+    };
     let row2 = app.write(|t| {
         db::move_entry(t, row, Some(new_parent.rowid), &new_name, &new_rel)?;
         db::record_change(
@@ -690,12 +729,11 @@ fn restore(app: &App, lib: &Library, row: &EntryRow) -> ApiResult<EntryRow> {
         .filter(|p| !p.is_trashed())
         .ok_or_else(|| ApiError::conflict("the folder it was in is gone"))?;
     let name = row.orig_name.clone().unwrap_or_else(|| row.name.clone());
-    let dest = fsx::join(&parent.path, &name);
     let _guard = lib.lock.blocking_lock();
-    if lib.fs.exists(&dest) {
-        return Err(ApiError::conflict("the name is taken now"));
-    }
-    lib.fs.rename_new(&row.path, &dest)?;
+    // Back where it was; if its name was taken since, under the next free one.
+    let (dest, name) = first_free(&parent.path, &name, row.kind == Kind::Folder, |rel| {
+        lib.fs.rename_new(&row.path, rel)
+    })?;
     let _ = lib.fs.remove_all(fsx::parent_of(&row.path)); // the empty holder
     let row2 = app.write(|t| {
         db::move_entry(t, row, Some(parent.rowid), &name, &dest)?;
@@ -736,7 +774,8 @@ pub struct DeleteQuery {
     permanent: Option<bool>,
 }
 
-/// `DELETE /v1/entries/{id}`
+/// `DELETE /v1/entries/{id}`: always to the trash. Nothing in the API deletes permanently; only the server
+/// empties the trash, after the library's `trash_days` (never, with 0).
 pub async fn delete_entry(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
@@ -746,23 +785,27 @@ pub async fn delete_entry(
 ) -> ApiResult<Response> {
     let a = app.clone();
     tokio::task::spawn_blocking(move || -> ApiResult<()> {
+        if q.permanent.unwrap_or(false) {
+            return Err(ApiError::invalid(
+                "deletes are never permanent: the entry goes to the trash, which the server empties",
+            ));
+        }
         let row = a.db.read(|c| Ok(load(c, &key, &id)))??;
         let lib = writable(&a, &key, &row)?;
         check_if_match(&headers, &row)?;
-        if q.permanent.unwrap_or(false) || lib.cfg.trash_days == 0 || row.is_trashed() {
-            if row.is_trashed() && row.trash_root != Some(row.rowid) {
-                return Err(ApiError::conflict("delete the folder it was deleted with"));
-            }
-            delete_permanently(&a, &lib, &row)
-        } else {
-            trash(&a, &lib, &row).map(|_| ())
+        if row.is_trashed() {
+            return Err(ApiError::conflict(
+                "already in the trash, which the server empties; restore it with PATCH {\"trashed\": false}",
+            ));
         }
+        trash(&a, &lib, &row).map(|_| ())
     })
     .await??;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Permanently deletes trashed entries older than their library's `trash_days`.
+/// Permanently deletes trashed entries older than their library's `trash_days` (0: kept for good). The only
+/// permanent deletion there is.
 pub fn purge_trash(app: &App) -> anyhow::Result<()> {
     for lib in &app.libraries {
         if lib.cfg.trash_days == 0 {
@@ -785,4 +828,26 @@ pub fn purge_trash(app: &App) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nth_name;
+
+    #[test]
+    fn next_names() {
+        assert_eq!(nth_name("IMG_1.jpg", 0, false), "IMG_1.jpg");
+        assert_eq!(
+            nth_name("IMG_1.jpg", 1, false),
+            "IMG_1.jpg".replace(".jpg", "-1.jpg")
+        );
+        assert_eq!(nth_name("archive.tar.gz", 2, false), "archive.tar-2.gz");
+        assert_eq!(nth_name("README", 3, false), "README-3");
+        assert_eq!(nth_name(".hidden", 1, false), ".hidden-1");
+        assert_eq!(
+            nth_name("Trip.2026", 1, true),
+            "Trip.2026-1",
+            "folders keep their dots"
+        );
+    }
 }

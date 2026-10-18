@@ -18,7 +18,7 @@ id = "photos"            # its API ID is lib_photos
 name = "Photos"
 path = "/photos"
 read_only = false
-trash_days = 30          # 0: deletes are permanent
+trash_days = 30          # deletes go to the trash, emptied after this many days; 0: never
 watch = "auto"           # auto | poll (use poll for NFS/SMB mounts)
 poll_seconds = 60
 

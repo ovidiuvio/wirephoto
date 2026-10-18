@@ -50,7 +50,7 @@ fn library_json(lib: &crate::app::Library) -> Library {
         name: lib.cfg.name.clone(),
         root: lib.root_id.read().clone(),
         read_only: lib.cfg.read_only,
-        trash: lib.cfg.trash_days > 0,
+        trash_days: lib.cfg.trash_days,
         indexing: lib.status.get(),
         watch: if lib.live.load(std::sync::atomic::Ordering::Relaxed) {
             Watch::Live

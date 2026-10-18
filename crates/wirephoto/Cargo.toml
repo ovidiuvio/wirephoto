@@ -34,7 +34,7 @@ r2d2_sqlite = "0.35.0"
 rand = "0.10.3"
 redb = "4.4.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-rustix = { version = "1.1.5", features = ["net"] }
+rustix = { version = "1.1.5", features = ["fs", "net"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"

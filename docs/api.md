@@ -27,14 +27,17 @@ are in [design.md](design.md).
    renamed, moved or trashed. Clients never build IDs from paths.
 4. **URLs are given, not built.** Entries carry the URLs of their bytes and previews; clients use them as they
    are.
-5. **Versions.** Every entry has an `etag`, also sent as the `ETag` header. Writing bytes is always conditional:
-   `If-Match: <etag>` to replace, `If-None-Match: *` to create. `PATCH` and `DELETE` honour `If-Match` when sent.
-6. **Digests.** File hashes are SHA-256, written as lowercase hex in JSON and in the RFC 9530 form in headers
+5. **Versions.** Every entry has an `etag`, also sent as the `ETag` header. `PATCH` and `DELETE` honour
+   `If-Match` when sent.
+6. **Nothing is overwritten or permanently deleted.** Writing bytes always makes a new file, and identical
+   bytes are not stored twice (section 6). A name that is taken never fails a request: the server uses the next
+   free one (`IMG_1.jpg`, `IMG_1-1.jpg`, `IMG_1-2.jpg`…) and the response says which. Deletes go to the trash.
+7. **Digests.** File hashes are SHA-256, written as lowercase hex in JSON and in the RFC 9530 form in headers
    (`sha-256=:<base64>:`).
-7. **Lists** are paged with `limit` (default 200, maximum 1000) and an opaque `cursor`. The response is
+8. **Lists** are paged with `limit` (default 200, maximum 1000) and an opaque `cursor`. The response is
    `{"items": [...], "next": "<cursor>"}`; `next` is omitted on the last page.
-8. **Errors** are `application/problem+json` (RFC 9457) with a stable `code` (section 9).
-9. **Compatibility.** New fields, endpoints and enum values are added without changing `v1`; clients ignore what
+9. **Errors** are `application/problem+json` (RFC 9457) with a stable `code` (section 9).
+10. **Compatibility.** New fields, endpoints and enum values are added without changing `v1`; clients ignore what
    they do not know.
 
 ## 2. Authentication
@@ -92,7 +95,7 @@ A library is a folder on the server's disks (a mounted share counts), defined in
   "name": "NAS Photos",
   "root": "ent_0a1b",
   "readOnly": false,
-  "trash": true,
+  "trashDays": 30,
   "indexing": {"state": "scanning", "done": 412000, "total": 1180000},
   "watch": "live"
 }
@@ -106,7 +109,7 @@ A library is a folder on the server's disks (a mounted share counts), defined in
 | Field | |
 |---|---|
 | `root` | The library's top folder. |
-| `trash` | `false` when deletes are permanent. |
+| `trashDays` | How long a deleted entry stays in the trash before the server removes it; `0`: until removed by hand on the server. Nothing in the API deletes permanently. |
 | `indexing` | Present while the server is still reading the library. Entries are listed from the start; `media` and `sha256` fill in as indexing proceeds. `state` is `scanning` (reading the folders), `reading` (media facts) or `hashing`. |
 | `watch` | `live` (changes on disk appear at once) or `polling` (they appear within the poll interval, as on network mounts). |
 
@@ -245,13 +248,20 @@ Writing needs a `write` key and a library that is not read-only.
 
 ### `PUT /v1/entries/{folder}/children/{name}` — new file
 
-The request body is the file. Requires `If-None-Match: *`; `412` if the name is taken. `201` with the new
-entry, whose `sha256` and `media` are already filled in. The file appears whole or not at all.
+The request body is the file. Never refused for its name, and never overwrites anything:
 
-### `PUT /v1/entries/{id}/content` — replace a file
+- If the folder already holds a file with exactly these bytes (under any name), nothing is stored: `200` with
+  that file's entry.
+- Otherwise the file is stored under `name`, or under the next free name if `name` is taken (`name-1.jpg`, …):
+  `201` with the new entry, whose `name` says which, and whose `sha256` and `media` are already filled in.
 
-Requires `If-Match` with the file's current `etag` (`412` if it changed). Atomic: readers see the old file or
-the new one. `200` with the updated entry.
+The file appears whole or not at all. `If-None-Match: *` is accepted and changes nothing.
+
+### `PUT /v1/entries/{id}/content` — new contents for a file
+
+Saved as a **new file beside it**; the original is never overwritten. The same as a `PUT` into its folder
+under its name: identical bytes store nothing (`200` with the existing entry), different bytes become the next
+free name (`201` with the new entry). `If-Match` is not needed.
 
 ### Integrity
 
@@ -272,7 +282,8 @@ against it and, on a mismatch, discards them and answers `400 digest-mismatch`; 
   defaults to the original's.
 - Copies may go to another library. Where the filesystem supports it, a copy shares the original's blocks and is
   instant.
-- `409` if the name is taken. `201` with the new entry.
+- A copy is a deliberate duplicate: it is made even when the bytes are already there. A taken name gets the
+  next free one (`Selects-1`, `IMG_1-1.jpg`). `201` with the new entry.
 
 ### `PATCH /v1/entries/{id}` — rename, move, restore
 
@@ -284,16 +295,19 @@ The body is a JSON Merge Patch (RFC 7396):
 
 | Field | |
 |---|---|
-| `name`, `parent` | Rename, move. Within one library; `409` if the name is taken. |
-| `trashed: false` | Restore from the trash to where it was. `409` if that name is taken now. |
+| `name`, `parent` | Rename, move. Within one library. A taken name gets the next free one. |
+| `trashed: false` | Restore from the trash to where it was, under its old name or, if that is taken now, the next free one. |
 
 `200` with the updated entry.
 
 ### `DELETE /v1/entries/{id}`
 
 Moves the entry (a folder with everything in it) to the library's trash; it keeps its ID and gets
-`trashed: true`. The trash is emptied after the library's `trash_days`. `?permanent=true` deletes at once, as
-does any delete in a library without a trash, or of an entry already in the trash. `204`.
+`trashed: true`. `204`.
+
+**Nothing in the API deletes permanently.** The server empties the trash after the library's `trashDays`
+(never, when it is `0`); until then `PATCH {"trashed": false}` restores. Deleting an entry already in the trash
+is `409`, and `?permanent=true` is `400`.
 
 ### Deduplication
 
@@ -392,12 +406,11 @@ Apps act on `code`; `title` and `detail` are for people.
 | `unauthenticated` | 401 | Missing, unknown or revoked key; bad `sig` |
 | `forbidden` | 403 | Read-only key or library; key used from another origin |
 | `not-found` | 404 | No such entry or library |
-| `conflict` | 409 | Name taken; move across libraries |
+| `conflict` | 409 | Move across libraries; deleting what is in the trash; a folder into itself |
 | `history-expired` | 410 | `since` is older than the kept history |
-| `version-mismatch` | 412 | `If-Match` / `If-None-Match` failed |
+| `version-mismatch` | 412 | `If-Match` failed (`PATCH`, `DELETE`) |
 | `too-large` | 413 | Over a limit (batch, previews) |
 | `unsupported-media` | 415 | Cannot preview this file |
-| `version-required` | 428 | A byte write without `If-Match` / `If-None-Match` |
 | `internal` | 500 | A bug |
 | `storage-unavailable` | 503 | The library's folder cannot be read (an unmounted share) |
 

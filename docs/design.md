@@ -71,9 +71,13 @@ previews), capture time (for sorting), duration (videos) and a SHA-256 hash.
   embedded preview unless the library is set to decode RAWs fully.
 
 **Writing**
-- New files, replacing files, folders, rename, move, copy (across libraries; instant where the filesystem shares
-  blocks), trash and restore, batches of up to 100 requests.
-- Every byte write is conditional and can be integrity-checked; files appear whole or not at all.
+- New files (new contents for a file are saved beside it), folders, rename, move, copy (across libraries;
+  instant where the filesystem shares blocks), trash and restore, batches of up to 100 requests.
+- **Nothing is overwritten or permanently deleted.** Identical bytes are not stored twice in a folder; a taken
+  name gets the next free one (`IMG_1-1.jpg`), and the filesystem itself refuses to replace (hard links,
+  `renameat2(RENAME_NOREPLACE)` / `renameatx_np(RENAME_EXCL)`); deletes go to the trash, which only the
+  server empties.
+- Byte writes can be integrity-checked; files appear whole or not at all.
 - Fast uploads: parallel over HTTP/2, streamed straight to disk, hash and previews made while the bytes arrive.
 
 **Deduplication**
@@ -254,7 +258,7 @@ id = "nas"               # lib_nas
 name = "NAS Photos"
 path = "/photos"
 read_only = false
-trash_days = 30          # 0: deletes are permanent
+trash_days = 30          # deletes go to the trash, emptied after this many days; 0: never
 watch = "auto"           # auto | poll
 poll_seconds = 60
 raw_full_decode = false  # true: 2560 px previews decode the RAW when its embedded preview is smaller

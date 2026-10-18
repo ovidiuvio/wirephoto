@@ -56,7 +56,9 @@ pub struct Library {
     pub name: String,
     pub root: String,
     pub read_only: bool,
-    pub trash: bool,
+    /// Days a deleted entry stays in the trash before the server removes it; 0: kept until removed by hand on
+    /// the server. Deletes through the API are never permanent.
+    pub trash_days: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexing: Option<Indexing>,
     pub watch: Watch,

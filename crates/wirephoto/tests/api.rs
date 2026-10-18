@@ -513,20 +513,11 @@ async fn previews_single_and_streamed() {
 }
 
 #[tokio::test]
-async fn uploads_replace_and_digests() {
+async fn uploads_dedup_and_digests() {
     let t = setup().await;
     let folder = t.entry_at("/2026").await;
     let fid = folder["id"].as_str().unwrap();
     let bytes = jpeg(800, 600);
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/entries/{fid}/children/new.jpg"))
-                .body(Body::from(bytes.clone()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 428);
-
     let wrong = format!("sha-256=:{}:", wirephoto::util::b64(&[0u8; 32]));
     let r = t
         .send(
@@ -569,55 +560,54 @@ async fn uploads_replace_and_digests() {
         .collect();
     assert!(leftovers.is_empty(), "no temporary files left behind");
 
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/entries/{fid}/children/new.jpg"))
-                .header(header::IF_NONE_MATCH, "*")
-                .body(Body::from(bytes.clone()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 412, "the name is taken");
-
-    // Replace: needs the current etag.
-    let id = e["id"].as_str().unwrap();
+    let put = |name: &str, body: Vec<u8>| {
+        t.req("PUT", &format!("/v1/entries/{fid}/children/{name}"))
+            .body(Body::from(body))
+            .unwrap()
+    };
+    // The same bytes again, under any name: nothing stored, the file already there is the answer.
+    for name in ["new.jpg", "other-name.jpg"] {
+        let r = t.send(put(name, bytes.clone())).await;
+        assert_eq!(r.status, 200, "{name}: already there");
+        assert_eq!(r.json()["id"], e["id"]);
+    }
+    assert!(!t.lib.join("2026/other-name.jpg").exists());
+    // Different bytes under a taken name: stored beside it, never over it.
     let new_bytes = jpeg(400, 300);
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/entries/{id}/content"))
-                .body(Body::from(new_bytes.clone()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 428);
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/entries/{id}/content"))
-                .header(header::IF_MATCH, "\"nope\"")
-                .body(Body::from(new_bytes.clone()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 412);
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/entries/{id}/content"))
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}\"", e["etag"].as_str().unwrap()),
-                )
-                .body(Body::from(new_bytes.clone()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = t.send(put("new.jpg", new_bytes.clone())).await;
+    assert_eq!(r.status, 201);
     let e2 = r.json();
-    assert_ne!(e2["etag"], e["etag"]);
-    assert_eq!(e2["id"], e["id"]);
-    assert_eq!(e2["media"]["width"], 400);
+    assert_eq!(e2["name"], "new-1.jpg");
+    assert_ne!(e2["id"], e["id"]);
     assert_eq!(
         std::fs::read(t.lib.join("2026/new.jpg")).unwrap(),
+        bytes,
+        "untouched"
+    );
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/new-1.jpg")).unwrap(),
         new_bytes
+    );
+
+    // New contents for a file: saved as a new file beside it; the same contents store nothing.
+    let id = e["id"].as_str().unwrap();
+    let content = |body: Vec<u8>| {
+        t.req("PUT", &format!("/v1/entries/{id}/content"))
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let r = t.send(content(bytes.clone())).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["id"], e["id"]);
+    let third = jpeg(500, 300);
+    let r = t.send(content(third.clone())).await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["name"], "new-2.jpg");
+    assert_eq!(r.json()["media"]["width"], 500);
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/new.jpg")).unwrap(),
+        bytes,
+        "untouched"
     );
 
     // A read-only key cannot write.
@@ -659,7 +649,8 @@ async fn organise_trash_and_restore() {
             json!({"parent": year["id"], "name": "Selects", "kind": "folder"}),
         )
         .await;
-    assert_eq!(r.status, 409);
+    assert_eq!(r.status, 201, "a taken name gets the next free one");
+    assert_eq!(r.json()["name"], "Selects-1");
 
     // Move + rename keeps the ID.
     let r = t
@@ -695,16 +686,15 @@ async fn organise_trash_and_restore() {
         .await;
     assert_eq!(r.status, 201);
     assert_eq!(r.json()["sha256"], a["sha256"]);
-    assert_eq!(
-        t.json(
+    let r = t
+        .json(
             "POST",
             "/v1/entries",
-            json!({"parent": year["id"], "copyOf": aid})
+            json!({"parent": year["id"], "copyOf": aid}),
         )
-        .await
-        .status,
-        409
-    );
+        .await;
+    assert_eq!(r.status, 201);
+    assert_eq!(r.json()["name"], "Lisbon-001-1.jpg");
 
     // Moving a folder moves what is in it.
     let lisbon = t.entry_at("/2026/Lisbon").await;
@@ -760,7 +750,8 @@ async fn organise_trash_and_restore() {
     assert!(t.lib.join("2026/Selects/Lisbon-001.jpg").exists());
     assert!(r.json().get("trashed").is_none());
 
-    // Trash a folder, then delete it for good.
+    // Trash a folder; deleting it again is refused, and so is a permanent delete: nothing is ever gone for good
+    // through the API.
     let r = t
         .send(
             t.req(
@@ -784,10 +775,27 @@ async fn organise_trash_and_restore() {
             .unwrap(),
         )
         .await;
-    assert_eq!(r.status, 204);
-    assert_eq!(t.get(&format!("/v1/entries/{aid}")).await.status, 404);
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json()["code"], "conflict");
+    let b = t.entry_at("/2026/Portugal/b.jpg").await;
+    let r = t
+        .send(
+            t.req(
+                "DELETE",
+                &format!("/v1/entries/{}?permanent=true", b["id"].as_str().unwrap()),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert!(t.lib.join("2026/Portugal/b.jpg").exists());
+    assert_eq!(
+        t.get(&format!("/v1/entries/{aid}")).await.json()["trashed"],
+        true
+    );
     assert!(
-        !t.lib
+        t.lib
             .join(".wirephoto-trash")
             .join(selects["id"].as_str().unwrap())
             .exists()
@@ -851,20 +859,9 @@ async fn changes_catch_up() {
         )
         .await
         .json();
-    let r = t
-        .send(
-            t.req(
-                "DELETE",
-                &format!(
-                    "/v1/entries/{}?permanent=true",
-                    created["id"].as_str().unwrap()
-                ),
-            )
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 204);
+    // Removed on disk (the API never deletes for good).
+    std::fs::remove_dir(t.lib.join("2026/New")).unwrap();
+    rescan(&t).await;
 
     let ch = t.get(&format!("/v1/changes?since={since}")).await.json();
     let list = ch["changes"].as_array().unwrap();
@@ -1067,11 +1064,12 @@ async fn videos_get_posters_and_durations() {
     assert_eq!(r.status, 200);
     assert_eq!(decode_size(&r.body), (160, 120));
 
-    // Uploaded: probed and given a poster from the written file.
+    // Uploaded: probed and given a poster from the written file. (Into another folder: the same bytes beside
+    // the first clip would be recognised as already there.)
     let scratch = tempfile::tempdir().unwrap();
     let up = scratch.path().join("up.mp4");
     mp4(&up);
-    let folder = t.entry_at("/2026").await;
+    let folder = t.entry_at("/2026/Lisbon").await;
     let r = t
         .send(
             t.req(
@@ -1307,4 +1305,57 @@ async fn changes_between_registering_the_watcher_and_applying_it_are_kept() {
     tokio::time::timeout(std::time::Duration::from_secs(10), found)
         .await
         .expect("the change made before watching was applied");
+}
+
+#[tokio::test]
+async fn renames_moves_and_restores_never_replace() {
+    let t = setup().await;
+    let (a, b) = (
+        t.entry_at("/2026/Lisbon/a.jpg").await,
+        t.entry_at("/2026/Lisbon/b.jpg").await,
+    );
+    let a_bytes = std::fs::read(t.lib.join("2026/Lisbon/a.jpg")).unwrap();
+    // Renamed onto a taken name: the next free one; the other file is untouched.
+    let r = t
+        .json(
+            "PATCH",
+            &format!("/v1/entries/{}", b["id"].as_str().unwrap()),
+            json!({"name": "a.jpg"}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["name"], "a-1.jpg");
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/Lisbon/a.jpg")).unwrap(),
+        a_bytes
+    );
+    // Trashed, its name taken meanwhile, restored: beside the newcomer.
+    let aid = a["id"].as_str().unwrap();
+    let r = t
+        .send(
+            t.req("DELETE", &format!("/v1/entries/{aid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 204);
+    std::fs::write(t.lib.join("2026/Lisbon/a.jpg"), b"newcomer").unwrap();
+    rescan(&t).await;
+    let r = t
+        .json(
+            "PATCH",
+            &format!("/v1/entries/{aid}"),
+            json!({"trashed": false}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["name"], "a-2.jpg");
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/Lisbon/a.jpg")).unwrap(),
+        b"newcomer"
+    );
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/Lisbon/a-2.jpg")).unwrap(),
+        a_bytes
+    );
 }
