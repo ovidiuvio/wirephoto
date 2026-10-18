@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::preview::render::{self, Decoded, Encoder};
 
-pub use pool::{Input, Pool};
+pub use pool::{DecodeFailed, Input, Pool, is_decode_failure};
 
 /// Requests and replies larger than this are refused (the largest uploads kept in memory are far smaller).
 const MAX_MESSAGE: usize = 1 << 30;

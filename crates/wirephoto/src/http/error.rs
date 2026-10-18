@@ -95,6 +95,16 @@ impl ApiError {
             "This file cannot be previewed",
         )
     }
+    /// The preview could not be made this time (a decode worker crashed or hung, the file could not be opened):
+    /// not a verdict on the file, unlike `unsupported-media`.
+    pub fn preview_failed(d: impl Into<String>) -> ApiError {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "preview-failed",
+            "The preview could not be made right now; try again",
+        )
+        .detail(d)
+    }
     pub fn storage_unavailable(d: impl Into<String>) -> ApiError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

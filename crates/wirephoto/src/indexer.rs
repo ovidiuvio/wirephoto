@@ -241,6 +241,7 @@ pub fn index_tree(app: &App, lib: &Library, rowid: i64, rel: &str) -> anyhow::Re
 /// The full scan of a library (blocking).
 pub fn scan(app: &App, lib: &Library) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
+    tracing::info!(library = %lib.api_id, path = %lib.fs.root.display(), "scanning");
     lib.status.set(Some(IndexingState::Scanning), 0, 0);
     let root = ensure_root(app, lib)?;
     walk(app, lib, vec![(root, String::new())], true)?;
@@ -252,7 +253,12 @@ pub fn scan(app: &App, lib: &Library) -> anyhow::Result<()> {
         )?)
     })?;
     lib.status.set(None, 0, 0);
-    tracing::info!(library = %lib.api_id, entries = total, secs = started.elapsed().as_secs_f32(), "scanned");
+    tracing::info!(
+        "{}: scanned in {}, {} entries",
+        lib.api_id,
+        duration_words(started.elapsed().as_secs_f64()),
+        thousands(total as u64)
+    );
     Ok(())
 }
 
@@ -511,6 +517,37 @@ pub fn store_facts(
 }
 
 /// Pre-generates the cached preview size. Returns how many entries were handled.
+/// `preview_done`: not made yet / made (or not previewable) / failed for a reason that may pass (a worker that
+/// crashed, a file that could not be opened): left alone until the next start, which retries it.
+pub const PREVIEW_PENDING: i64 = 0;
+pub const PREVIEW_DONE: i64 = 1;
+pub const PREVIEW_DEFERRED: i64 = 2;
+
+/// Failures logged one by one before only every hundredth is (a broken setup fails every photo).
+const FAILURES_LOGGED: u64 = 20;
+static PREVIEW_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn log_preview_failure(lib: &str, path: &str, e: &anyhow::Error, permanent: bool) {
+    let n = PREVIEW_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    let what = if permanent {
+        "cannot be previewed"
+    } else {
+        "preview failed, retried after a restart"
+    };
+    if n <= FAILURES_LOGGED {
+        tracing::warn!(library = %lib, path = %path, "{what}: {e:#}");
+        if n == FAILURES_LOGGED {
+            tracing::warn!(
+                "further preview failures are logged one in a hundred (debug level logs each)"
+            );
+        }
+    } else if n.is_multiple_of(100) {
+        tracing::warn!(library = %lib, path = %path, failures = n, "{what}: {e:#}");
+    } else {
+        tracing::debug!(library = %lib, path = %path, "{what}: {e:#}");
+    }
+}
+
 async fn preview_pass(app: &Arc<App>) -> anyhow::Result<usize> {
     if !app.config.cache.pregenerate {
         return Ok(0);
@@ -531,36 +568,43 @@ async fn preview_pass(app: &Arc<App>) -> anyhow::Result<usize> {
         let app = app.clone();
         Some(async move {
             let src = preview::Source::File(lib.fs.clone(), row.path.clone());
-            let ok = match app.previews.ensure_cached(&row, src).await {
-                Ok(_) => true,
+            let outcome = match app.previews.ensure_cached(&row, src).await {
+                Ok(_) => PREVIEW_DONE,
                 Err(e) => {
-                    tracing::debug!(entry = %row.id, path = %row.path, "no preview: {e:#}");
-                    false
+                    let permanent = crate::decode::is_decode_failure(&e);
+                    log_preview_failure(&row.library, &row.path, &e, permanent);
+                    if permanent { -1 } else { PREVIEW_DEFERRED }
                 }
             };
-            (row, ok)
+            (row, outcome)
         })
     });
     let results = futures::future::join_all(jobs).await;
+    // The previews must be on disk before the index says so: otherwise a stop in between loses them for good.
+    let disk = app.previews.disk().clone();
+    tokio::task::spawn_blocking(move || disk.flush()).await??;
     app.write(|t| {
-        for (row, ok) in &results {
-            if *ok {
-                t.execute(
-                    "UPDATE entries SET preview_done = 1 WHERE rowid = ?",
-                    [row.rowid],
-                )?;
-            } else {
-                t.execute(
-                    "UPDATE entries SET preview_done = 1, previewable = 0 WHERE rowid = ?",
-                    [row.rowid],
-                )?;
-                db::record_change(
-                    t,
-                    ChangeType::Updated,
-                    &row.id,
-                    &row.library,
-                    row.parent_id.as_deref(),
-                )?;
+        for (row, outcome) in &results {
+            match *outcome {
+                -1 => {
+                    t.execute(
+                        "UPDATE entries SET preview_done = 1, previewable = 0 WHERE rowid = ?",
+                        [row.rowid],
+                    )?;
+                    db::record_change(
+                        t,
+                        ChangeType::Updated,
+                        &row.id,
+                        &row.library,
+                        row.parent_id.as_deref(),
+                    )?;
+                }
+                state => {
+                    t.execute(
+                        "UPDATE entries SET preview_done = ? WHERE rowid = ?",
+                        params![state, row.rowid],
+                    )?;
+                }
             }
         }
         Ok(())
@@ -649,6 +693,9 @@ fn pending_counts(app: &App, lib: &str) -> anyhow::Result<(u64, u64)> {
 /// Runs the background passes forever: facts first (listings need them), then the cached preview (grids need
 /// it), then hashes (only deduplication needs them).
 pub async fn background(app: Arc<App>) {
+    if let Err(e) = retry_failed_previews(&app) {
+        tracing::warn!("resetting failed previews: {e:#}");
+    }
     loop {
         for lib in &app.libraries {
             if lib
@@ -687,32 +734,38 @@ pub async fn background(app: Arc<App>) {
                 }
             }
         }
+        // Facts and previews take turns, a batch each: thumbnails start with the first files read instead of
+        // after the whole library. Hashing (whole-file reads) waits until both are idle.
         let a = app.clone();
-        let did = match tokio::task::spawn_blocking(move || media_pass(&a)).await {
-            Ok(Ok(n)) if n > 0 => true,
+        let facts = match tokio::task::spawn_blocking(move || media_pass(&a)).await {
+            Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 tracing::warn!("media pass: {e:#}");
-                false
+                0
             }
-            _ => match preview_pass(&app).await {
-                Ok(n) if n > 0 => true,
-                Err(e) => {
-                    tracing::warn!("preview pass: {e:#}");
-                    false
-                }
-                _ => {
-                    let a = app.clone();
-                    match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
-                        Ok(Ok(n)) => n > 0,
-                        Ok(Err(e)) => {
-                            tracing::warn!("hash pass: {e:#}");
-                            false
-                        }
-                        Err(_) => false,
-                    }
-                }
-            },
+            Err(_) => 0,
         };
+        let previews = match preview_pass(&app).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("preview pass: {e:#}");
+                0
+            }
+        };
+        let hashes = if facts == 0 && previews == 0 {
+            let a = app.clone();
+            match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    tracing::warn!("hash pass: {e:#}");
+                    0
+                }
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+        let did = facts + previews + hashes > 0;
         if !did {
             tokio::select! {
                 _ = app.work.notified() => {}
@@ -809,6 +862,189 @@ pub fn sweep_previews(app: &App) -> anyhow::Result<u64> {
     Ok(removed)
 }
 
+/// At start: previews that failed for a reason that may have passed are tried again. Once per index, also the
+/// photos an older server marked unpreviewable after ANY failure (a crashed worker, a file it could not open
+/// for want of permission): their facts are read again and their previews retried.
+pub fn retry_failed_previews(app: &App) -> anyhow::Result<()> {
+    let first = app.db.meta_get("previews_retry_v1")?.is_none();
+    let (deferred, rechecked) = app.write(|t| {
+        let deferred = t.execute(
+            "UPDATE entries SET preview_done = ? WHERE preview_done = ?",
+            params![PREVIEW_PENDING, PREVIEW_DEFERRED],
+        )?;
+        let rechecked = if first {
+            t.execute(
+                "UPDATE entries SET media_state = 0, preview_done = 0 WHERE kind IN (1, 2, 3) AND previewable = 0",
+                [],
+            )?
+        } else {
+            0
+        };
+        Ok((deferred, rechecked))
+    })?;
+    if first {
+        app.db.meta_set("previews_retry_v1", b"1")?;
+    }
+    if deferred + rechecked > 0 {
+        tracing::info!(deferred, rechecked, "retrying previews that failed before");
+    }
+    Ok(())
+}
+
+/// Logs each library's progress every 30 seconds while there is work, and once when it is done: what the
+/// server is doing, how fast, and how long it has left.
+pub async fn report(app: Arc<App>) {
+    #[derive(Default, Clone, Copy)]
+    struct Counts {
+        files: u64,
+        facts_pending: u64,
+        previews_pending: u64,
+        previews_done: u64,
+        deferred: u64,
+        not_previewable: u64,
+        hashes_pending: u64,
+    }
+    const EVERY: Duration = Duration::from_secs(30);
+    let mut last: HashMap<String, (Counts, bool, u64)> = HashMap::new();
+    let pregenerate = app.config.cache.pregenerate;
+    loop {
+        tokio::time::sleep(EVERY).await;
+        for lib in &app.libraries {
+            let id = lib.api_id.clone();
+            let scanning = lib
+                .status
+                .get()
+                .filter(|s| s.state == IndexingState::Scanning);
+            let (prev, was_busy, prev_listed) = last.get(&id).copied().unwrap_or_default();
+            if let Some(s) = scanning {
+                let rate = s.done.saturating_sub(prev_listed) as f64 / EVERY.as_secs_f64();
+                tracing::info!(
+                    "{id}: scanning folders, {} entries listed ({}/s)",
+                    thousands(s.done),
+                    rate.round()
+                );
+                last.insert(id, (prev, true, s.done));
+                continue;
+            }
+            let lib_id = id.clone();
+            let counts = app.db.read(move |c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(SUM(kind != 0), 0),
+                            COALESCE(SUM(kind != 0 AND media_state = 0), 0),
+                            COALESCE(SUM(previewable = 1 AND preview_done = 0), 0),
+                            COALESCE(SUM(previewable = 1 AND preview_done = 1), 0),
+                            COALESCE(SUM(preview_done = 2), 0),
+                            COALESCE(SUM(kind IN (1, 2, 3) AND media_state != 0 AND previewable = 0), 0),
+                            COALESCE(SUM(kind != 0 AND sha256 IS NULL), 0)
+                     FROM entries WHERE library = ? AND trashed_at IS NULL AND missing = 0",
+                    [&lib_id],
+                    |r| {
+                        Ok(Counts {
+                            files: r.get::<_, i64>(0)? as u64,
+                            facts_pending: r.get::<_, i64>(1)? as u64,
+                            previews_pending: r.get::<_, i64>(2)? as u64,
+                            previews_done: r.get::<_, i64>(3)? as u64,
+                            deferred: r.get::<_, i64>(4)? as u64,
+                            not_previewable: r.get::<_, i64>(5)? as u64,
+                            hashes_pending: r.get::<_, i64>(6)? as u64,
+                        })
+                    },
+                )?)
+            });
+            let Ok(now) = counts else { continue };
+            let previews_pending = if pregenerate { now.previews_pending } else { 0 };
+            let busy = now.facts_pending + previews_pending + now.hashes_pending > 0;
+            let stage = |name: &str, pending: u64, before: u64, total: u64| -> Option<String> {
+                if pending == 0 {
+                    return None;
+                }
+                let rate = before.saturating_sub(pending) as f64 / EVERY.as_secs_f64();
+                let left = if rate > 0.0 && was_busy {
+                    format!(", {} left", duration_words(pending as f64 / rate))
+                } else {
+                    String::new()
+                };
+                let speed = match (was_busy, rate > 0.0) {
+                    (true, true) => format!(" ({rate:.1}/s{left})"),
+                    // Hashing waits for facts and previews; anything not moving is queued behind them.
+                    (true, false) => " (waiting)".to_string(),
+                    _ => String::new(),
+                };
+                Some(format!(
+                    "{name} {} / {}{speed}",
+                    thousands(total - pending),
+                    thousands(total)
+                ))
+            };
+            if busy {
+                let parts: Vec<String> = [
+                    stage(
+                        "reading files",
+                        now.facts_pending,
+                        prev.facts_pending,
+                        now.files,
+                    ),
+                    stage(
+                        "previews",
+                        previews_pending,
+                        prev.previews_pending,
+                        now.previews_pending + now.previews_done,
+                    ),
+                    stage(
+                        "hashing",
+                        now.hashes_pending,
+                        prev.hashes_pending,
+                        now.files,
+                    ),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                tracing::info!("{id}: {}", parts.join(" · "));
+            } else if was_busy || !last.contains_key(&id) {
+                let deferred = if now.deferred > 0 {
+                    format!(
+                        ", {} failed and retried after a restart",
+                        thousands(now.deferred)
+                    )
+                } else {
+                    String::new()
+                };
+                tracing::info!(
+                    "{id}: up to date: {} files, {} previews, {} not previewable{deferred}",
+                    thousands(now.files),
+                    thousands(now.previews_done),
+                    thousands(now.not_previewable)
+                );
+            }
+            last.insert(id, (now, busy, 0));
+        }
+    }
+}
+
+/// 1234567 -> "1,234,567".
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Seconds as "about 2 h 05 min", "about 4 min", "under a minute".
+fn duration_words(secs: f64) -> String {
+    let m = (secs / 60.0).round() as u64;
+    match m {
+        0 => "under a minute".into(),
+        1..=59 => format!("about {m} min"),
+        _ => format!("about {} h {:02} min", m / 60, m % 60),
+    }
+}
+
 /// Runs the background passes until there is nothing left to do (tests, and tools that want a settled index).
 pub async fn settle(app: &Arc<App>) -> anyhow::Result<()> {
     loop {
@@ -820,5 +1056,18 @@ pub async fn settle(app: &Arc<App>) -> anyhow::Result<()> {
         if facts + previews + hashes == 0 {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn numbers_and_durations() {
+        assert_eq!(super::thousands(0), "0");
+        assert_eq!(super::thousands(999), "999");
+        assert_eq!(super::thousands(1_234_567), "1,234,567");
+        assert_eq!(super::duration_words(20.0), "under a minute");
+        assert_eq!(super::duration_words(240.0), "about 4 min");
+        assert_eq!(super::duration_words(7500.0), "about 2 h 05 min");
     }
 }

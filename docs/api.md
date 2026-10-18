@@ -411,6 +411,7 @@ Apps act on `code`; `title` and `detail` are for people.
 | `version-mismatch` | 412 | `If-Match` failed (`PATCH`, `DELETE`) |
 | `too-large` | 413 | Over a limit (batch, previews) |
 | `unsupported-media` | 415 | Cannot preview this file |
+| `preview-failed` | 503 | The preview could not be made this time (a decoder crashed, the file could not be opened); try again |
 | `internal` | 500 | A bug |
 | `storage-unavailable` | 503 | The library's folder cannot be read (an unmounted share) |
 

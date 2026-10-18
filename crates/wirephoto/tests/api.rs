@@ -983,8 +983,11 @@ async fn worker_crash_costs_one_preview() {
     let url = format!("/v1/entries/{}/preview/320.jpg", a["id"].as_str().unwrap());
 
     let r = t.get(&url).await;
-    assert_eq!(r.status, 415, "the crash costs this preview");
-    assert_eq!(r.json()["code"], "unsupported-media");
+    assert_eq!(
+        r.status, 503,
+        "the crash costs this preview, and says to try again"
+    );
+    assert_eq!(r.json()["code"], "preview-failed");
     let r = t.get(&url).await;
     assert_eq!(r.status, 200, "a new worker takes over");
     assert_eq!(decode_size(&r.body), (320, 240));
@@ -1357,5 +1360,48 @@ async fn renames_moves_and_restores_never_replace() {
     assert_eq!(
         std::fs::read(t.lib.join("2026/Lisbon/a-2.jpg")).unwrap(),
         a_bytes
+    );
+}
+
+#[tokio::test]
+async fn a_crash_during_pregeneration_defers_and_a_restart_retries() {
+    // The first worker dies on its first request: a broken environment, not a broken file.
+    let scratch = tempfile::tempdir().unwrap();
+    let script = scratch.path().join("decoder.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif mkdir {dir:?}/crashed 2>/dev/null; then head -c 1 >/dev/null; kill -SEGV $$; fi\nexec {exe:?} \"$@\"\n",
+            dir = scratch.path(),
+            exe = env!("CARGO_BIN_EXE_wirephoto"),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let t = setup_with(&format!("[decode]\nprogram = {script:?}\nworkers = 1\n")).await;
+    let lib = t.app.libraries[0].api_id.clone();
+    let count = |sql: &'static str| {
+        let lib = lib.clone();
+        t.app
+            .db
+            .read(move |c| Ok(c.query_row(sql, [&lib], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let deferred = "SELECT COUNT(*) FROM entries WHERE library = ? AND preview_done = 2";
+    let unpreviewable =
+        "SELECT COUNT(*) FROM entries WHERE library = ? AND kind = 1 AND previewable = 0";
+    assert_eq!(count(deferred), 1, "the crashed one waits for a retry");
+    assert_eq!(count(unpreviewable), 0, "and is not judged unpreviewable");
+    // A restart retries it.
+    wirephoto::indexer::retry_failed_previews(&t.app).unwrap();
+    wirephoto::indexer::settle(&t.app).await.unwrap();
+    assert_eq!(count(deferred), 0);
+    let done =
+        "SELECT COUNT(*) FROM entries WHERE library = ? AND previewable = 1 AND preview_done = 1";
+    assert_eq!(
+        count(done),
+        3,
+        "a.jpg, b.jpg and logo.png all have their preview"
     );
 }

@@ -162,10 +162,7 @@ pub async fn get_preview(
         .previews
         .get(&row, Source::File(lib.fs.clone(), row.path.clone()), size)
         .await
-        .map_err(|e| {
-            tracing::debug!(entry = %row.id, "preview failed: {e:#}");
-            ApiError::unsupported_media()
-        })?;
+        .map_err(|e| preview_error(&row, &e))?;
     let cache = if q.v.is_some() {
         "private, max-age=31536000, immutable"
     } else {
@@ -257,8 +254,8 @@ pub async fn post_previews(
                 .await
             {
                 Ok((b, _)) => frame(i as u32, 200, &b),
-                Err(_) => {
-                    let e = ApiError::unsupported_media();
+                Err(e) => {
+                    let e = preview_error(&row, &e);
                     frame(i as u32, e.status.as_u16(), &problem_bytes(&e))
                 }
             }
@@ -272,6 +269,18 @@ pub async fn post_previews(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .map_err(|_| ApiError::internal())
+}
+
+/// A file the decoder cannot read is `415`; anything else (a crashed worker, a file that could not be opened)
+/// is `503`, worth trying again, and logged: it says the server has a problem, not the file.
+fn preview_error(row: &crate::db::EntryRow, e: &anyhow::Error) -> ApiError {
+    if crate::decode::is_decode_failure(e) {
+        tracing::debug!(entry = %row.id, path = %row.path, "cannot be previewed: {e:#}");
+        ApiError::unsupported_media()
+    } else {
+        tracing::warn!(entry = %row.id, path = %row.path, "preview failed: {e:#}");
+        ApiError::preview_failed(format!("{e:#}"))
+    }
 }
 
 #[cfg(test)]

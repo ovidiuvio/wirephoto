@@ -43,7 +43,8 @@ impl CacheReader {
             Ok(db) => Handle::Direct(db),
             // Open for writing elsewhere, or not closed cleanly (which a read-only open will not repair).
             Err(DatabaseError::DatabaseAlreadyOpen | DatabaseError::RepairAborted) => {
-                let dir = tempfile::tempdir()?;
+                // Beside the cache, not in /tmp (often memory, in a container): the copy is as big as the cache.
+                let dir = tempfile::tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
                 let copy = dir.path().join("previews.redb");
                 std::fs::copy(path, &copy)?;
                 Handle::Snapshot(Database::create(&copy)?, dir)

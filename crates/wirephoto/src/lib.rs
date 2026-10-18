@@ -122,5 +122,6 @@ pub fn start(app: &Arc<App>) {
         });
     }
     tokio::spawn(indexer::background(app.clone()));
+    tokio::spawn(indexer::report(app.clone()));
     tokio::spawn(indexer::upkeep(app.clone()));
 }

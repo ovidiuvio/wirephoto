@@ -186,6 +186,7 @@ impl DiskCache {
                     }
                 }
                 w.set_durability(Durability::Immediate)?;
+                w.set_quick_repair(true);
                 w.commit()?;
                 let bytes: u64 = gone.iter().map(|g| g.1).sum();
                 self.total.fetch_sub(bytes, Ordering::Relaxed);
@@ -205,6 +206,9 @@ impl DiskCache {
         if self.dirty.swap(false, Ordering::Relaxed) {
             let mut w = self.db.begin_write()?;
             w.set_durability(Durability::Immediate)?;
+            // Records the allocator state with the commit, so opening after a crash or a kill is near instant
+            // instead of a walk over the whole file.
+            w.set_quick_repair(true);
             w.commit()?;
         }
         Ok(())
@@ -245,6 +249,7 @@ impl DiskCache {
             }
         }
         w.set_durability(Durability::Immediate)?;
+        w.set_quick_repair(true);
         w.commit()?;
         self.total.fetch_sub(freed, Ordering::Relaxed);
         Ok(freed)

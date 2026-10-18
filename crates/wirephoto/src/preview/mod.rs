@@ -294,7 +294,15 @@ impl RenderJob {
                 return Ok(jpeg);
             }
             self.renders.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
             let jpeg = render(&self.pool, &self.entry, &self.src, self.size)?;
+            tracing::debug!(
+                path = %self.entry.path,
+                size = self.size,
+                ms = started.elapsed().as_millis() as u64,
+                bytes = jpeg.len(),
+                "rendered preview"
+            );
             self.disk.put(&self.key, &jpeg)?;
             Ok(jpeg)
         })

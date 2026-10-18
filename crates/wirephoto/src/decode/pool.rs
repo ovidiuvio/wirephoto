@@ -81,7 +81,8 @@ impl Pool {
         )
     }
 
-    /// Runs one request in a worker (blocking). Errors are the decoder's, or the worker's death.
+    /// Runs one request in a worker (blocking). Errors are the decoder's ([`DecodeFailed`]: the file cannot be
+    /// read), or anything else: the worker's death, a timeout, no worker to start.
     pub fn run(&self, op: Op, input: Input) -> anyhow::Result<Vec<u8>> {
         let timeout = match &op {
             Op::Preview {
@@ -211,6 +212,25 @@ fn exchange(
     w.sock.read_exact(&mut payload)?;
     Ok(match status[0] {
         0 => Ok(payload),
-        _ => Err(anyhow!("{}", String::from_utf8_lossy(&payload))),
+        _ => Err(DecodeFailed(String::from_utf8_lossy(&payload).into_owned()).into()),
     })
+}
+
+/// A worker ran and its decoder could not read the file: the file's own fault (format, damage), so retrying will
+/// not help. Every other error from [`Pool::run`] is the environment's (a worker that crashed or hung, a file
+/// that could not be opened) and may well pass.
+#[derive(Debug)]
+pub struct DecodeFailed(pub String);
+
+impl std::fmt::Display for DecodeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DecodeFailed {}
+
+/// Whether an error says the file itself cannot be decoded (as opposed to a failure that may pass).
+pub fn is_decode_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<DecodeFailed>())
 }

@@ -114,6 +114,8 @@ fn main() -> anyhow::Result<()> {
         return wirephoto::decode::worker_main();
     }
     tracing_subscriber::fmt()
+        // Colour codes only for a terminal: a container log viewer shows them as junk.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("WIREPHOTO_LOG")
                 .unwrap_or_else(|_| "wirephoto=info,tower_http=warn".into()),
@@ -138,6 +140,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, router) = wirephoto::build(config)?;
     wirephoto::start(&app);
     let service = router.into_make_service();
+    // `docker stop` (SIGTERM) or Ctrl-C: stop taking requests, let the ones in flight finish, then make the
+    // preview cache durable so nothing made is lost and the next start opens it at once.
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            tracing::info!("stopping");
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+    }
     match tls {
         Some(tls) => {
             let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
@@ -147,15 +160,36 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 })?;
             tracing::info!(%listen, "serving HTTPS (HTTP/2 and HTTP/1.1)");
             axum_server::bind_rustls(listen, rustls)
+                .handle(handle)
                 .serve(service)
                 .await?;
         }
         None => {
             tracing::info!(%listen, "serving plain HTTP: put a TLS-terminating proxy in front for browser apps");
-            axum_server::bind(listen).serve(service).await?;
+            axum_server::bind(listen)
+                .handle(handle)
+                .serve(service)
+                .await?;
         }
     }
+    let disk = app.previews.disk().clone();
+    tokio::task::spawn_blocking(move || disk.flush()).await??;
+    tracing::info!("stopped; preview cache saved");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn health(config: &Config) -> anyhow::Result<()> {
