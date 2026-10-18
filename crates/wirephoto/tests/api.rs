@@ -247,6 +247,12 @@ async fn cors_allows_key_origins_only() {
     assert_eq!(r.header("access-control-max-age").as_deref(), Some("7200"));
     let r = t.send(pre("https://evil.example")).await;
     assert!(r.header("access-control-allow-origin").is_none());
+    // A cross-origin isolated page (COEP require-corp) may embed previews by their signed URLs.
+    let r = t.get("/healthz").await;
+    assert_eq!(
+        r.header("cross-origin-resource-policy").as_deref(),
+        Some("cross-origin")
+    );
 }
 
 #[tokio::test]

@@ -59,7 +59,9 @@ wirephoto keys revoke laptop-browser
   carrying the key from another origin is rejected. Requests without an `Origin` header (curl, scripts) are not
   affected. A key without `--origin` is for scripts only.
 - **CORS** allows exactly the origins of existing keys. Preflights are cached for two hours, and Private/Local
-  Network Access preflights are answered for the same origins.
+  Network Access preflights are answered for the same origins. Responses carry
+  `Cross-Origin-Resource-Policy: cross-origin`, so a cross-origin isolated app (`COEP: require-corp`) can show
+  previews in `<img>`; the signature guards them, not the embedding origin.
 - **Signed URLs.** The byte and preview URLs in an entry carry a `sig` bound to the key that received them, so
   they work in `<img>` and `<video>` without a header. A `sig` stays the same for the life of the key (the
   browser can cache by URL) and stops working when the key is revoked.

@@ -145,15 +145,22 @@ fn cors(app: Arc<App>) -> CorsLayer {
         .allow_private_network(true)
 }
 
-async fn timing_allow_origin(
+async fn cross_origin_headers(
     req: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
     let mut r = next.run(req).await;
+    let h = r.headers_mut();
     // Lets apps on other origins read Server-Timing in their own performance tools.
-    r.headers_mut().insert(
+    h.insert(
         HeaderName::from_static("timing-allow-origin"),
         HeaderValue::from_static("*"),
+    );
+    // Lets a cross-origin isolated page (COEP require-corp) show previews in <img> by their signed URLs; the
+    // signature, not the embedding origin, is what guards them.
+    h.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("cross-origin"),
     );
     r
 }
@@ -189,7 +196,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(|| async { error::ApiError::not_found() })
         .with_state(app.clone());
     let _ = app.router.set(api.clone());
-    api.layer(middleware::from_fn(timing_allow_origin))
+    api.layer(middleware::from_fn(cross_origin_headers))
         .layer(cors(app))
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
