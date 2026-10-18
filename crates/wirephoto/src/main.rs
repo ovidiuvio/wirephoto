@@ -40,6 +40,31 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+    /// Pauses background work (reading files, making previews, hashing) until `resume`, also across
+    /// restarts. Requests and changes on disk are still served and indexed.
+    Pause,
+    /// Resumes background work paused with `pause`.
+    Resume,
+    /// What the running server is doing: each library's progress, how long previews take by type, the cache
+    /// and the decode workers. Run it where the server runs (`docker exec wirephoto wirephoto status`).
+    Status,
+    /// Lists the audit trail: changes made through the API, refused requests, key changes, what the server
+    /// deleted itself. Newest last.
+    Audit {
+        /// How far back: `30m`, `24h`, `7d` (default 24h).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Only this key (its name).
+        #[arg(long)]
+        key: Option<String>,
+        /// Only this operation (upload, create-folder, copy, move, delete, restore, denied, key-create,
+        /// key-revoke, purge).
+        #[arg(long)]
+        op: Option<String>,
+        /// At most this many (the newest).
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Looks inside the preview cache, for debugging. Works while the server runs (reads a copy).
     Cache {
         #[command(subcommand)]
@@ -113,20 +138,49 @@ fn main() -> anyhow::Result<()> {
     if let Command::Decode = cli.command {
         return wirephoto::decode::worker_main();
     }
-    tracing_subscriber::fmt()
-        // Colour codes only for a terminal: a container log viewer shows them as junk.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("WIREPHOTO_LOG")
-                .unwrap_or_else(|_| "wirephoto=info,tower_http=warn".into()),
-        )
-        .init();
     let config = Config::load(&cli.config)?;
+    // Kept to the end of `main`: dropping it writes out what the log file has buffered.
+    let _log = init_logging(&config, matches!(cli.command, Command::Serve));
     match cli.command {
         Command::Serve => tokio::runtime::Runtime::new()?.block_on(serve(config)),
         Command::Keys { command } => keys(config, command),
         Command::Health => health(&config),
         Command::Cache { command } => cache(config, command),
+        Command::Status => status(&config),
+        Command::Pause | Command::Resume => {
+            let pause = matches!(cli.command, Command::Pause);
+            let db = open_db(&config)?;
+            wirephoto::indexer::set_paused(&db, pause)?;
+            wirephoto::audit::record_in(
+                &db,
+                wirephoto::audit::Event {
+                    client: Some("cli".into()),
+                    ..wirephoto::audit::Event::new(
+                        if pause { "pause" } else { "resume" },
+                        if pause {
+                            "background work paused"
+                        } else {
+                            "background work resumed"
+                        },
+                    )
+                },
+            );
+            println!(
+                "{} (a running server notices within 5 seconds).",
+                if pause {
+                    "Paused reading files, previews and hashing"
+                } else {
+                    "Resumed"
+                }
+            );
+            Ok(())
+        }
+        Command::Audit {
+            since,
+            key,
+            op,
+            limit,
+        } => audit(&config, &since, key.as_deref(), op.as_deref(), limit),
         Command::Decode => unreachable!(),
     }
 }
@@ -139,7 +193,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let tls = config.tls.clone();
     let (app, router) = wirephoto::build(config)?;
     wirephoto::start(&app);
-    let service = router.into_make_service();
+    // With the client's address, for the access log and the audit trail.
+    let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
     // `docker stop` (SIGTERM) or Ctrl-C: stop taking requests, let the ones in flight finish, then make the
     // preview cache durable so nothing made is lost and the next start opens it at once.
     let handle = axum_server::Handle::new();
@@ -233,6 +288,25 @@ fn keys(config: Config, command: KeysCommand) -> anyhow::Result<()> {
             let libs = (!libraries.is_empty())
                 .then(|| libraries.iter().map(|l| format!("lib_{l}")).collect());
             let (k, token) = Keys::create(&db, &name, scope, libs, origin)?;
+            wirephoto::audit::record_in(
+                &db,
+                wirephoto::audit::Event {
+                    client: Some("cli".into()),
+                    ..wirephoto::audit::Event::new(
+                        "key-create",
+                        format!(
+                            "created key {} ({}, {})",
+                            k.name,
+                            if k.scope == Scope::Write {
+                                "write"
+                            } else {
+                                "read"
+                            },
+                            k.origin.as_deref().unwrap_or("scripts only")
+                        ),
+                    )
+                },
+            );
             println!("{token}");
             eprintln!(
                 "Created key {:?} ({}). This is the only time it is shown.",
@@ -269,6 +343,13 @@ fn keys(config: Config, command: KeysCommand) -> anyhow::Result<()> {
         }
         KeysCommand::Revoke { name } => {
             if Keys::revoke(&db, &name)? {
+                wirephoto::audit::record_in(
+                    &db,
+                    wirephoto::audit::Event {
+                        client: Some("cli".into()),
+                        ..wirephoto::audit::Event::new("key-revoke", format!("revoked key {name}"))
+                    },
+                );
                 eprintln!("Revoked {name:?}. Its signed URLs stop working too.");
             } else {
                 anyhow::bail!("no key named {name:?}");
@@ -455,4 +536,189 @@ fn human(bytes: u64) -> String {
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
         b => format!("{b} B"),
     }
+}
+
+/// The log: the console (`docker logs`) and, for the server, also a file a day in `<data>/logs` (`[log] file`),
+/// kept `keep_days`. `WIREPHOTO_LOG` filters both (default `wirephoto=info`).
+fn init_logging(
+    config: &Config,
+    serving: bool,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
+    // The other commands print their own results: only warnings from the log, unless asked.
+    let filter = || {
+        EnvFilter::try_from_env("WIREPHOTO_LOG").unwrap_or_else(|_| {
+            if serving {
+                "wirephoto=info,tower_http=warn"
+            } else {
+                "wirephoto=warn"
+            }
+            .into()
+        })
+    };
+    let console = tracing_subscriber::fmt::layer()
+        // Colour codes only for a terminal: a container log viewer shows them as junk.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .with_filter(filter());
+    let mut guard = None;
+    let file = (serving && config.log.file)
+        .then(|| {
+            let dir = config.data.join("logs");
+            std::fs::create_dir_all(&dir)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| {
+                    Ok(tracing_appender::rolling::RollingFileAppender::builder()
+                        .rotation(tracing_appender::rolling::Rotation::DAILY)
+                        .filename_prefix("wirephoto.log")
+                        .max_log_files(config.log.keep_days.max(1))
+                        .build(&dir)?)
+                })
+                .map_err(|e| eprintln!("no log file in {}: {e:#}", dir.display()))
+                .ok()
+        })
+        .flatten()
+        .map(|appender| {
+            let (writer, g) = tracing_appender::non_blocking(appender);
+            guard = Some(g);
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(filter())
+        });
+    tracing_subscriber::registry()
+        .with(console)
+        .with(file)
+        .init();
+    guard
+}
+
+/// `30m`, `24h`, `7d` as seconds.
+fn parse_age(s: &str) -> anyhow::Result<i64> {
+    let (n, unit) = s.split_at(s.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
+    let n: i64 = n
+        .parse()
+        .with_context(|| format!("not an age: {s:?} (like 30m, 24h, 7d)"))?;
+    Ok(n * match unit {
+        "s" => 1,
+        "m" | "min" => 60,
+        "h" | "" => 3600,
+        "d" => 86400,
+        _ => anyhow::bail!("not an age: {s:?} (like 30m, 24h, 7d)"),
+    })
+}
+
+fn audit(
+    config: &Config,
+    since: &str,
+    key: Option<&str>,
+    op: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let db = open_db(config)?;
+    let since = wirephoto::util::now_secs() - parse_age(since)?;
+    let rows = wirephoto::audit::list(&db, since, key, op, limit)?;
+    for r in &rows {
+        let time = chrono::DateTime::from_timestamp(r.time, 0)
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        println!(
+            "{time}  {:<13} {:>3} {:>6} ms  key={} client={}  {}{}",
+            r.op,
+            r.status,
+            r.ms,
+            r.key.as_deref().unwrap_or("-"),
+            r.client.as_deref().unwrap_or("-"),
+            r.path
+                .as_deref()
+                .map(|p| format!("/{p}  "))
+                .unwrap_or_default(),
+            r.detail
+        );
+    }
+    eprintln!("{} events", rows.len());
+    Ok(())
+}
+
+fn status(config: &Config) -> anyhow::Result<()> {
+    let db = open_db(config)?;
+    let Some(raw) = db.meta_get("status")? else {
+        println!("No status yet: the server is not running, or started less than 30 seconds ago.");
+        return Ok(());
+    };
+    let s: wirephoto::indexer::Snapshot = serde_json::from_slice(&raw)?;
+    let now = wirephoto::util::now_secs();
+    let ago = now - s.time;
+    let words = |secs: i64| -> String {
+        let m = secs / 60;
+        match m {
+            0 => format!("{secs} s"),
+            1..=59 => format!("{m} min"),
+            _ => format!("{} h {:02} min", m / 60, m % 60),
+        }
+    };
+    println!("wirephoto {}, up {}", s.version, words(s.time - s.started));
+    if wirephoto::indexer::paused_in(&db) {
+        println!("  background work is PAUSED (wirephoto resume continues it)");
+    }
+    if ago > 90 {
+        println!(
+            "  (as of {} ago: the server seems to be stopped)",
+            words(ago)
+        );
+    }
+    for l in &s.libraries {
+        let watch = if l.watching {
+            "watching for changes".to_string()
+        } else {
+            format!("polling every {} s", l.poll_seconds.max(5))
+        };
+        println!("\n{} \"{}\" ({}), {watch}", l.id, l.name, l.path);
+        println!("  {}", l.progress);
+    }
+    let ms = |v: u64| {
+        if v >= 1000 {
+            format!("{:.2} s", v as f64 / 1000.0)
+        } else {
+            format!("{v} ms")
+        }
+    };
+    println!("\nPreviews made since start, time each:");
+    if s.times.is_empty() {
+        println!("  none yet");
+    } else {
+        println!(
+            "  {:<14} {:>8} {:>9} {:>9} {:>9} {:>9}",
+            "from", "count", "mean", "median", "95%", "slowest"
+        );
+        for t in &s.times {
+            println!(
+                "  {:<14} {:>8} {:>9} {:>9} {:>9} {:>9}",
+                t.kind,
+                t.count,
+                ms(t.mean_ms),
+                ms(t.p50_ms),
+                ms(t.p95_ms),
+                ms(t.max_ms)
+            );
+        }
+    }
+    println!(
+        "\nPreviews served: {} from memory, {} from the disk cache, {} rendered from originals",
+        s.served_memory, s.served_disk, s.rendered
+    );
+    println!(
+        "Preview cache: {} of {}",
+        human(s.cache_bytes),
+        human(s.cache_budget)
+    );
+    println!(
+        "Decode workers: {} at once ({} for pre-generation); {} started, {} lost",
+        s.workers, s.background, s.workers_started, s.workers_lost
+    );
+    Ok(())
 }

@@ -80,6 +80,42 @@ pub struct App {
     pub router: std::sync::OnceLock<axum::Router>,
     /// The CORS allow-list (origins holding a key) and when it was read.
     pub origins: RwLock<(std::time::Instant, Vec<String>)>,
+    /// When the API last had a request (unix ms): background work waits until it has been idle a while.
+    pub api_activity: std::sync::atomic::AtomicI64,
+    /// Background work is waiting for the API to go idle (for the progress log and `wirephoto status`).
+    pub yielding: std::sync::atomic::AtomicBool,
+}
+
+impl App {
+    /// A request came in, or a response went out.
+    pub fn api_active(&self) {
+        self.api_activity.store(
+            crate::util::now_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether the API had a request within the quiet period (`[background] yield_seconds`).
+    pub fn api_busy(&self) -> bool {
+        let quiet = self.config.background.yield_seconds as i64 * 1000;
+        quiet > 0
+            && crate::util::now_millis()
+                - self.api_activity.load(std::sync::atomic::Ordering::Relaxed)
+                < quiet
+    }
+
+    /// Waits until the API has been idle for the quiet period: requests come first.
+    pub async fn yield_to_requests(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.api_busy() {
+            return;
+        }
+        self.yielding.store(true, Ordering::Relaxed);
+        while self.api_busy() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        self.yielding.store(false, Ordering::Relaxed);
+    }
 }
 
 impl App {

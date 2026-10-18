@@ -230,6 +230,7 @@ fn same_content(
 pub async fn put_child(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     Path((folder, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Body,
@@ -241,7 +242,7 @@ pub async fn put_child(
     let k = key.clone();
     let parent =
         tokio::task::spawn_blocking(move || a.db.read(|c| Ok(load(c, &k, &folder)))).await???;
-    save_new(app, key, parent, name, headers, body).await
+    save_new(app, key, info.map(|i| i.0), parent, name, headers, body).await
 }
 
 /// `PUT /v1/entries/{id}/content`: new contents for a file, saved as a NEW file beside it (the original is
@@ -250,6 +251,7 @@ pub async fn put_child(
 pub async fn put_content(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Body,
@@ -267,12 +269,13 @@ pub async fn put_content(
         Ok((row, parent))
     })
     .await??;
-    save_new(app, key, parent, row.name, headers, body).await
+    save_new(app, key, info.map(|i| i.0), parent, row.name, headers, body).await
 }
 
 async fn save_new(
     app: Arc<App>,
     key: crate::auth::KeyRow,
+    info: Option<crate::audit::RequestInfo>,
     parent: EntryRow,
     name: String,
     headers: HeaderMap,
@@ -281,6 +284,8 @@ async fn save_new(
     if parent.kind != Kind::Folder || parent.is_trashed() {
         return Err(ApiError::invalid("parent is not a folder"));
     }
+    let started = std::time::Instant::now();
+    let asked = name.clone();
     let digest = content_digest(&headers)?;
     let lib = writable(&app, &key, &parent)?;
     let wanted = fsx::join(&parent.path, &name);
@@ -351,6 +356,33 @@ async fn save_new(
         Ok((entry, row.id, true))
     })
     .await??;
+    {
+        let detail = if created {
+            format!("stored {} ({} bytes)", entry.name, entry.size.unwrap_or(0))
+        } else {
+            format!(
+                "{asked}: the same bytes are already there as {}, nothing stored",
+                entry.name
+            )
+        };
+        let (app, info, kn, id, path) = (
+            app.clone(),
+            info.clone(),
+            key.name.clone(),
+            entry.id.clone(),
+            entry.path.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::audit::record(
+                &app,
+                crate::audit::Event::new("upload", detail)
+                    .by(info.as_ref(), Some(&kn))
+                    .entry(&id, &path)
+                    .status(if created { 201 } else { 200 })
+                    .took(started),
+            )
+        });
+    }
     if !created {
         return Ok(entry_response(entry));
     }
@@ -375,12 +407,37 @@ async fn save_new(
 pub async fn post_entry(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
     let req: CreateEntry =
         serde_json::from_slice(&body).map_err(|e| ApiError::invalid(e.to_string()))?;
+    let started = std::time::Instant::now();
     let a = app.clone();
+    let (op, detail) = match &req.copy_of {
+        Some(src) => ("copy", format!("copy of {src}")),
+        None => ("create-folder", "new folder".to_string()),
+    };
+    let kn = key.name.clone();
     let entry = tokio::task::spawn_blocking(move || create(&a, &key, req)).await??;
+    {
+        let (app, info, id, path) = (
+            app.clone(),
+            info.map(|i| i.0),
+            entry.id.clone(),
+            entry.path.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::audit::record(
+                &app,
+                crate::audit::Event::new(op, detail)
+                    .by(info.as_ref(), Some(&kn))
+                    .entry(&id, &path)
+                    .status(201)
+                    .took(started),
+            )
+        });
+    }
     let location = format!("/v1/entries/{}", entry.id);
     let mut r = entry_response(entry);
     *r.status_mut() = StatusCode::CREATED;
@@ -511,6 +568,7 @@ fn create(
 pub async fn patch_entry(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
@@ -537,23 +595,41 @@ pub async fn patch_entry(
         Some(serde_json::Value::Bool(b)) => Some(*b),
         _ => return Err(ApiError::invalid("trashed is true or false")),
     };
+    let started = std::time::Instant::now();
     let a = app.clone();
+    let info = info.map(|i| i.0);
     let entry = tokio::task::spawn_blocking(move || -> ApiResult<_> {
         let row = a.db.read(|c| Ok(load(c, &key, &id)))??;
         let lib = writable(&a, &key, &row)?;
         check_if_match(&headers, &row)?;
+        let audit = |op: &str, row: &EntryRow, detail: String| {
+            crate::audit::record(
+                &a,
+                crate::audit::Event::new(op, detail)
+                    .by(info.as_ref(), Some(&key.name))
+                    .entry(&row.id, &row.path)
+                    .took(started),
+            )
+        };
         let mut row = row;
         if trashed == Some(false) && row.is_trashed() {
             row = restore(&a, &lib, &row)?;
+            audit("restore", &row, format!("restored to {}", row.path));
         }
         if name.is_some() || parent.is_some() {
             if row.is_trashed() {
                 return Err(ApiError::conflict("restore it first"));
             }
+            let before = row.path.clone();
             row = rename(&a, &key, &lib, &row, name.as_deref(), parent.as_deref())?;
+            if row.path != before {
+                audit("move", &row, format!("{before} -> {}", row.path));
+            }
         }
         if trashed == Some(true) && !row.is_trashed() {
+            let before = row.path.clone();
             row = trash(&a, &lib, &row)?;
+            audit("delete", &row, format!("{before} moved to the trash"));
         }
         Ok(a.db.read(|c| Ok(to_api(&a, c, &row, &key)?))?)
     })
@@ -779,6 +855,7 @@ pub struct DeleteQuery {
 pub async fn delete_entry(
     State(app): State<Arc<App>>,
     Caller(key): Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     Path(id): Path<String>,
     Query(q): Query<DeleteQuery>,
     headers: HeaderMap,
@@ -798,7 +875,16 @@ pub async fn delete_entry(
                 "already in the trash, which the server empties; restore it with PATCH {\"trashed\": false}",
             ));
         }
-        trash(&a, &lib, &row).map(|_| ())
+        let started = std::time::Instant::now();
+        let trashed = trash(&a, &lib, &row)?;
+        crate::audit::record(
+            &a,
+            crate::audit::Event::new("delete", format!("{} moved to the trash", row.path))
+                .by(info.as_ref().map(|i| &i.0), Some(&key.name))
+                .entry(&trashed.id, &trashed.path)
+                .took(started),
+        );
+        Ok(())
     })
     .await??;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -822,8 +908,21 @@ pub fn purge_trash(app: &App) -> anyhow::Result<()> {
             Ok(rows)
         })?;
         for row in expired {
-            if let Err(e) = delete_permanently(app, lib, &row) {
-                tracing::warn!(entry = %row.id, "emptying trash: {e:?}");
+            let started = std::time::Instant::now();
+            match delete_permanently(app, lib, &row) {
+                Ok(()) => crate::audit::record(
+                    app,
+                    crate::audit::Event::new(
+                        "purge",
+                        format!(
+                            "deleted for good after {} days in the trash",
+                            lib.cfg.trash_days
+                        ),
+                    )
+                    .entry(&row.id, &row.path)
+                    .took(started),
+                ),
+                Err(e) => tracing::warn!(entry = %row.id, "emptying trash: {e:?}"),
             }
         }
     }

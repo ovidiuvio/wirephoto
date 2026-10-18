@@ -62,6 +62,20 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 CREATE INDEX IF NOT EXISTS changes_library ON changes(library, seq);
 
+CREATE TABLE IF NOT EXISTS audit (
+    id       INTEGER PRIMARY KEY,
+    time     INTEGER NOT NULL,
+    op       TEXT NOT NULL,
+    key      TEXT,
+    client   TEXT,
+    entry    TEXT,
+    path     TEXT,
+    detail   TEXT NOT NULL,
+    status   INTEGER NOT NULL,
+    ms       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_time ON audit(time);
+
 CREATE TABLE IF NOT EXISTS keys (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,

@@ -573,7 +573,7 @@ fn media_pass(app: &App) -> anyhow::Result<usize> {
         };
         let facts = lib.fs.open_file(&row.path).and_then(|f| {
             let mut facts = media::read_facts(&row.name, &f)?;
-            media::add_video_facts(&mut facts, app.previews.pool(), f);
+            media::add_video_facts(&mut facts, app.previews.bg_pool(), f);
             Ok(facts)
         });
         results.push((row, facts));
@@ -683,10 +683,13 @@ async fn preview_pass(app: &Arc<App>) -> anyhow::Result<usize> {
     if !app.config.cache.pregenerate {
         return Ok(0);
     }
+    // While the API is in use, one at a time (its workers already yield the CPU to requests'); a full batch
+    // otherwise.
+    let batch = if app.api_busy() { 1 } else { 16 };
     let rows: Vec<EntryRow> = app.db.read(|c| {
         let mut st = c.prepare(&format!(
             "SELECT {} FROM {} WHERE e.previewable = 1 AND e.preview_done = 0 AND e.trashed_at IS NULL AND e.missing = 0
-             ORDER BY e.dev, e.ino LIMIT 16",
+             ORDER BY e.dev, e.ino LIMIT {batch}",
             db::ENTRY_COLS,
             db::ENTRY_FROM
         ))?;
@@ -802,12 +805,17 @@ fn hash_pass(app: &App) -> anyhow::Result<usize> {
         let rows = st.query_map([], EntryRow::from_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })?;
+    let mut n = 0;
     for row in &rows {
+        if app.api_busy() {
+            break; // the rest after the API goes idle
+        }
         if let Err(e) = hash_entry(app, row) {
             tracing::debug!(entry = %row.id, "hash failed: {e:#}");
         }
+        n += 1;
     }
-    Ok(rows.len())
+    Ok(n)
 }
 
 fn pending_counts(app: &App, lib: &str) -> anyhow::Result<(u64, u64)> {
@@ -830,6 +838,10 @@ pub async fn background(app: Arc<App>) {
     tokio::spawn(facts_loop(app.clone()));
     let mut changes = app.seq.subscribe();
     loop {
+        if paused(&app) {
+            tokio::time::sleep(PAUSE_CHECK).await;
+            continue;
+        }
         for lib in &app.libraries {
             if lib
                 .status
@@ -878,6 +890,8 @@ pub async fn background(app: Arc<App>) {
             }
         };
         let hashes = if previews == 0 && facts_pending(&app) == 0 {
+            // Whole-file reads compete with downloads: hashing waits until the API is idle.
+            app.yield_to_requests().await;
             let a = app.clone();
             match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
                 Ok(Ok(n)) => n,
@@ -901,10 +915,35 @@ pub async fn background(app: Arc<App>) {
     }
 }
 
+/// How often paused background work looks whether it may resume.
+const PAUSE_CHECK: Duration = Duration::from_secs(5);
+
+/// Whether background work (reading files, previews, hashing) is paused: `wirephoto pause` / `resume`, which
+/// another process runs, so it is a flag in the index. Requests, scans and changes on disk carry on.
+pub fn paused(app: &App) -> bool {
+    paused_in(&app.db)
+}
+
+pub fn paused_in(db: &crate::db::Db) -> bool {
+    db.meta_get("paused")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == b"1")
+}
+
+/// Pauses or resumes background work (`wirephoto pause` / `resume`).
+pub fn set_paused(db: &crate::db::Db, paused: bool) -> anyhow::Result<()> {
+    db.meta_set("paused", if paused { b"1" } else { b"0" })
+}
+
 /// Reads media facts as fast as the disk allows, beside the preview loop.
 async fn facts_loop(app: Arc<App>) {
     let mut changes = app.seq.subscribe();
     loop {
+        if paused(&app) {
+            tokio::time::sleep(PAUSE_CHECK).await;
+            continue;
+        }
         let a = app.clone();
         let n = match tokio::task::spawn_blocking(move || media_pass(&a)).await {
             Ok(Ok(n)) => n,
@@ -970,6 +1009,9 @@ pub async fn upkeep(app: Arc<App>) {
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::write::purge_trash(&a) {
                     tracing::warn!("emptying trash: {e:#}");
+                }
+                if let Err(e) = crate::audit::prune(&a, a.config.log.audit_days) {
+                    tracing::warn!("pruning the audit trail: {e:#}");
                 }
                 let cutoff = crate::util::now_secs() - 30 * 24 * 3600;
                 let _ = a.db.write(|t| {
@@ -1068,8 +1110,11 @@ pub async fn report(app: Arc<App>) {
     const EVERY: Duration = Duration::from_secs(30);
     let mut last: HashMap<String, (Counts, bool, u64)> = HashMap::new();
     let pregenerate = app.config.cache.pregenerate;
+    let started = crate::util::now_secs();
+    let mut was_paused: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(EVERY).await;
+        let mut lines: Vec<(String, String)> = Vec::new();
         for lib in &app.libraries {
             let id = lib.api_id.clone();
             let scanning = lib
@@ -1079,11 +1124,13 @@ pub async fn report(app: Arc<App>) {
             let (prev, was_busy, prev_listed) = last.get(&id).copied().unwrap_or_default();
             if let Some(s) = scanning {
                 let rate = s.done.saturating_sub(prev_listed) as f64 / EVERY.as_secs_f64();
-                tracing::info!(
-                    "{id}: scanning folders, {} entries listed ({}/s)",
+                let line = format!(
+                    "scanning folders, {} entries listed ({}/s)",
                     thousands(s.done),
                     rate.round()
                 );
+                tracing::info!("{id}: {line}");
+                lines.push((id.clone(), line));
                 last.insert(id, (prev, true, s.done));
                 continue;
             }
@@ -1141,6 +1188,22 @@ pub async fn report(app: Arc<App>) {
                         thousands(total)
                     ))
                 };
+            if busy && paused(&app) {
+                let line = format!(
+                    "paused (wirephoto resume continues): {} files to read, {} previews to make, {} to hash",
+                    thousands(now.facts_pending),
+                    thousands(previews_pending),
+                    thousands(now.hashes_pending)
+                );
+                if !was_paused.contains(&id) {
+                    tracing::info!("{id}: {line}");
+                    was_paused.insert(id.clone());
+                }
+                lines.push((id.clone(), line));
+                last.insert(id, (now, false, 0));
+                continue;
+            }
+            was_paused.remove(&id);
             if busy {
                 let parts: Vec<String> = [
                     stage(
@@ -1165,8 +1228,13 @@ pub async fn report(app: Arc<App>) {
                 .into_iter()
                 .flatten()
                 .collect();
-                tracing::info!("{id}: {}", parts.join(" · "));
-            } else if was_busy || !last.contains_key(&id) {
+                let mut line = parts.join(" · ");
+                if app.api_busy() {
+                    line.push_str(" · slowed while the API is in use");
+                }
+                tracing::info!("{id}: {line}");
+                lines.push((id.clone(), line));
+            } else {
                 let deferred = if now.deferred > 0 {
                     format!(
                         ", {} failed and retried after a restart",
@@ -1175,15 +1243,90 @@ pub async fn report(app: Arc<App>) {
                 } else {
                     String::new()
                 };
-                tracing::info!(
-                    "{id}: up to date: {} files, {} previews, {} not previewable{deferred}",
+                let line = format!(
+                    "up to date: {} files, {} previews, {} not previewable{deferred}",
                     thousands(now.files),
                     thousands(now.previews_done),
                     thousands(now.not_previewable)
                 );
+                if was_busy || !last.contains_key(&id) {
+                    tracing::info!("{id}: {line}");
+                }
+                lines.push((id.clone(), line));
             }
             last.insert(id, (now, busy, 0));
         }
+        let snapshot = status_snapshot(&app, started, lines);
+        if let Ok(json) = serde_json::to_vec(&snapshot) {
+            let _ = app.db.meta_set("status", &json);
+        }
+    }
+}
+
+/// What the server is doing, saved every 30 s for `wirephoto status` (another process: it reads the index).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Snapshot {
+    pub version: String,
+    pub started: i64,
+    pub time: i64,
+    pub libraries: Vec<LibraryStatus>,
+    pub times: Vec<crate::preview::stats::TypeTimes>,
+    pub served_memory: u64,
+    pub served_disk: u64,
+    pub rendered: u64,
+    pub cache_bytes: u64,
+    pub cache_budget: u64,
+    pub workers: usize,
+    pub background: usize,
+    pub workers_started: u64,
+    pub workers_lost: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LibraryStatus {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub watching: bool,
+    pub poll_seconds: u64,
+    pub progress: String,
+}
+
+fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Snapshot {
+    let p = &app.previews;
+    let (served_memory, served_disk) = p.stats.served();
+    let (a, b) = (p.pool().stats(), p.bg_pool().stats());
+    let (workers_started, workers_lost) = (a.0 + b.0, a.1 + b.1);
+    Snapshot {
+        version: env!("CARGO_PKG_VERSION").into(),
+        started,
+        time: crate::util::now_secs(),
+        libraries: app
+            .libraries
+            .iter()
+            .map(|l| LibraryStatus {
+                id: l.api_id.clone(),
+                name: l.cfg.name.clone(),
+                path: l.fs.root.display().to_string(),
+                watching: l.live.load(Ordering::Relaxed),
+                poll_seconds: l.cfg.poll_seconds,
+                progress: lines
+                    .iter()
+                    .find(|(id, _)| *id == l.api_id)
+                    .map(|(_, line)| line.clone())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        times: p.stats.times(),
+        served_memory,
+        served_disk,
+        rendered: p.renders(),
+        cache_bytes: p.disk().total_bytes(),
+        cache_budget: app.config.cache.max_size,
+        workers: p.slots.0,
+        background: p.slots.1,
+        workers_started,
+        workers_lost,
     }
 }
 

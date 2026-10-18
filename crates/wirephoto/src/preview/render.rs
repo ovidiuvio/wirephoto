@@ -110,11 +110,22 @@ pub fn decode_jpeg(bytes: &[u8], target: u32) -> anyhow::Result<Decoded> {
 
 /// A RAW's embedded JPEG, decoded.
 pub fn decode_raw(file: &(impl rawjpeg::ReadAt + ?Sized), target: u32) -> anyhow::Result<Decoded> {
-    let e = rawjpeg::find_embedded(file)?.ok_or_else(|| anyhow!("no embedded preview"))?;
-    let bytes = file.read_at(e.offset, e.offset + e.length)?;
-    let mut d = decode_jpeg(&bytes, target)?;
-    d.orientation = e.orientation;
-    Ok(d)
+    let first = rawjpeg::find_embedded(file)?.ok_or_else(|| anyhow!("no embedded preview"))?;
+    let decode = |e: &rawjpeg::Embedded| -> anyhow::Result<Decoded> {
+        let bytes = file.read_at(e.offset, e.offset + e.length)?;
+        let mut d = decode_jpeg(&bytes, target)?;
+        d.orientation = e.orientation;
+        Ok(d)
+    };
+    match decode(&first) {
+        Ok(d) => Ok(d),
+        // The usual choice does not decode (an Olympus ORF's, for one): the other embedded images, largest first.
+        Err(first_err) => rawjpeg::all_embedded(file)?
+            .iter()
+            .filter(|e| e.offset != first.offset)
+            .find_map(|e| decode(e).ok())
+            .ok_or(first_err),
+    }
 }
 
 /// PNG, GIF (first frame), WebP, BMP, TIFF (first page) through the `image` crate.

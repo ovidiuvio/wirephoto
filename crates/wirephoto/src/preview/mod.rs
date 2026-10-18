@@ -11,6 +11,7 @@
 pub mod cache;
 pub mod inspect;
 pub mod render;
+pub mod stats;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,8 +53,25 @@ pub struct Previews {
     /// Background pre-generation, kept to a share of the CPUs.
     background: Arc<Semaphore>,
     pool: Arc<Pool>,
+    /// Background renderings' own workers, at low CPU priority.
+    bg_pool: Arc<Pool>,
     /// Renderings from originals so far (for tests and debugging).
     renders: Arc<AtomicU64>,
+    /// Timings by source type and what was served from where (`wirephoto status`).
+    pub stats: Arc<stats::Stats>,
+    /// Renderings at once in all, and of them for pre-generation.
+    pub slots: (usize, usize),
+}
+
+/// An error shared by everyone who waited on one rendering, as an error of one's own. A decoder's verdict on
+/// the file ([`crate::decode::DecodeFailed`]) stays one, or every failure would look like it may pass and be
+/// retried forever.
+fn unshare(e: Arc<anyhow::Error>) -> anyhow::Error {
+    if crate::decode::is_decode_failure(&e) {
+        crate::decode::DecodeFailed(format!("{e:#}")).into()
+    } else {
+        anyhow::anyhow!("{e:#}")
+    }
 }
 
 /// A preview's cache key. Once a file's hash is known its previews are keyed by CONTENT (`sha256-<hex>:<size>`),
@@ -102,7 +120,13 @@ pub fn valid_size(size: u32) -> bool {
 
 impl Previews {
     /// `workers`: how many renderings run at once (0: one per CPU); `memory`: bytes of previews kept in memory.
-    pub fn new(disk: cache::DiskCache, pool: Arc<Pool>, workers: usize, memory: u64) -> Previews {
+    pub fn new(
+        disk: cache::DiskCache,
+        pool: Arc<Pool>,
+        bg_pool: Arc<Pool>,
+        workers: usize,
+        memory: u64,
+    ) -> Previews {
         let cpus = match workers {
             0 => std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -111,6 +135,7 @@ impl Previews {
         };
         Previews {
             pool,
+            bg_pool,
             disk: Arc::new(disk),
             mem: moka::future::Cache::builder()
                 .weigher(|_k: &String, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
@@ -121,6 +146,8 @@ impl Previews {
             // Half the renderings for pre-generation (a NAS is mostly idle otherwise); requests get the rest.
             background: Arc::new(Semaphore::new((cpus / 2).max(1))),
             renders: Arc::new(AtomicU64::new(0)),
+            stats: Arc::new(stats::Stats::default()),
+            slots: (cpus, (cpus / 2).max(1)),
         }
     }
 
@@ -132,6 +159,11 @@ impl Previews {
         &self.pool
     }
 
+    /// The background workers (pre-generation, facts read in the background).
+    pub fn bg_pool(&self) -> &Arc<Pool> {
+        &self.bg_pool
+    }
+
     /// How many previews have been rendered from originals since start.
     pub fn renders(&self) -> u64 {
         self.renders.load(Ordering::Relaxed)
@@ -140,6 +172,7 @@ impl Previews {
     /// A cached preview, without rendering.
     pub async fn cached(&self, key: &str) -> Option<Bytes> {
         if let Some(b) = self.mem.get(key).await {
+            self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
             return Some(b);
         }
         let disk = self.disk.clone();
@@ -149,6 +182,7 @@ impl Previews {
             .ok()?
             .ok()??;
         let b = Bytes::from(found);
+        self.stats.served_disk.fetch_add(1, Ordering::Relaxed);
         self.mem.insert(key.to_string(), b.clone()).await;
         Some(b)
     }
@@ -163,7 +197,11 @@ impl Previews {
         let k = key(entry, size);
         // Sizes made from the 640 live in memory only: the disk never has them.
         let hit = if size < CACHED_SIZE {
-            self.mem.get(&k).await
+            let b = self.mem.get(&k).await;
+            if b.is_some() {
+                self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
+            }
+            b
         } else {
             self.cached(&k).await
         };
@@ -179,13 +217,20 @@ impl Previews {
         let started = Instant::now();
         let bytes = if size < CACHED_SIZE {
             let base = self.render_cached(entry, src, CACHED_SIZE).await?;
+            let stats = self.stats.clone();
             self.mem
                 .try_get_with(k, async move {
-                    let out = tokio::task::spawn_blocking(move || shrink(&base, size)).await??;
+                    let out = tokio::task::spawn_blocking(move || {
+                        let t = Instant::now();
+                        let out = shrink(&base, size);
+                        stats.record("from the 640", t.elapsed().as_millis() as u64);
+                        out
+                    })
+                    .await??;
                     anyhow::Ok(Bytes::from(out))
                 })
                 .await
-                .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))?
+                .map_err(unshare)?
         } else {
             self.render_cached(entry, src, size).await?
         };
@@ -209,7 +254,7 @@ impl Previews {
         if let Some(b) = self.cached(&k).await {
             return Ok(b);
         }
-        let job = self.job(entry, src, size, &k);
+        let job = self.job(entry, src, size, &k, self.pool.clone());
         let sem = self.interactive.clone();
         self.mem
             .try_get_with(k, async move {
@@ -217,7 +262,7 @@ impl Previews {
                 job.run().await
             })
             .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))
+            .map_err(unshare)
     }
 
     /// Makes sure the cached size exists (background pre-generation). Returns whether it rendered.
@@ -233,14 +278,14 @@ impl Previews {
             return Ok(false);
         }
         let _permit = self.background.clone().acquire_owned().await?;
-        let job = self.job(entry, src, CACHED_SIZE, &k);
+        let job = self.job(entry, src, CACHED_SIZE, &k, self.bg_pool.clone());
         let before = self.renders();
         let res = self
             .mem
             .entry(k.clone())
             .or_try_insert_with(async move { job.run().await })
             .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))?;
+            .map_err(unshare)?;
         // `is_fresh`: this call's own initializer ran (no request was rendering it, nothing was in memory).
         if res.is_fresh() {
             self.mem.invalidate(&k).await;
@@ -263,15 +308,16 @@ impl Previews {
         tokio::task::spawn_blocking(move || disk.contains(&k)).await?
     }
 
-    fn job(&self, entry: &EntryRow, src: Source, size: u32, k: &str) -> RenderJob {
+    fn job(&self, entry: &EntryRow, src: Source, size: u32, k: &str, pool: Arc<Pool>) -> RenderJob {
         RenderJob {
             entry: entry.clone(),
             src,
             size,
             key: k.to_string(),
             disk: self.disk.clone(),
-            pool: self.pool.clone(),
+            pool,
             renders: self.renders.clone(),
+            stats: self.stats.clone(),
         }
     }
 }
@@ -285,6 +331,7 @@ struct RenderJob {
     disk: Arc<cache::DiskCache>,
     pool: Arc<Pool>,
     renders: Arc<AtomicU64>,
+    stats: Arc<stats::Stats>,
 }
 
 impl RenderJob {
@@ -297,6 +344,10 @@ impl RenderJob {
             self.renders.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let jpeg = render(&self.pool, &self.entry, &self.src, self.size)?;
+            self.stats.record(
+                &kind_label(&self.entry),
+                started.elapsed().as_millis() as u64,
+            );
             tracing::debug!(
                 path = %self.entry.path,
                 size = self.size,
@@ -322,6 +373,20 @@ pub fn shrink(jpeg: &[u8], size: u32) -> anyhow::Result<Vec<u8>> {
         render::Encoder::Turbo
     };
     render::finish(render::decode_jpeg(jpeg, size)?, size, encoder)
+}
+
+/// A source type as `wirephoto status` names it.
+pub fn kind_label(entry: &EntryRow) -> String {
+    match format(entry) {
+        Format::Jpeg => "jpeg".into(),
+        Format::Raw => "raw".into(),
+        Format::Heif => match entry.mime.as_deref() {
+            Some("image/avif") => "avif".into(),
+            _ => "heic".into(),
+        },
+        Format::Video { .. } => "video".into(),
+        Format::Image { mime, .. } => mime.rsplit('/').next().unwrap_or("other").to_string(),
+    }
 }
 
 /// How a worker decodes this entry.

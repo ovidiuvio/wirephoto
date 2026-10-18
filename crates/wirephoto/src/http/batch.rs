@@ -32,6 +32,7 @@ fn allowed(method: &Method, path: &str) -> bool {
 pub async fn post_batch(
     State(app): State<Arc<App>>,
     _caller: Caller,
+    info: Option<axum::Extension<crate::audit::RequestInfo>>,
     headers: HeaderMap,
     Json(req): Json<BatchRequest>,
 ) -> ApiResult<Json<BatchResponse>> {
@@ -78,6 +79,10 @@ pub async fn post_batch(
             }
             None => Body::empty(),
         };
+        // Who is asking, for the audit trail of each request in it (they skip the access log's layer).
+        if let Some(info) = &info {
+            b = b.extension(info.0.clone());
+        }
         let Ok(request) = b.body(body) else {
             let e = ApiError::invalid("malformed request");
             responses.push(SubResponse {

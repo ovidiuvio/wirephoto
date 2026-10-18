@@ -1467,3 +1467,163 @@ async fn per_folder_watches_follow_new_folders_and_skip_ignored_ones() {
         "ignored folders are neither indexed nor watched"
     );
 }
+
+#[tokio::test]
+async fn the_audit_trail_records_who_did_what() {
+    let t = setup().await;
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap();
+    let put = |name: &str, body: Vec<u8>| {
+        t.req("PUT", &format!("/v1/entries/{fid}/children/{name}"))
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let bytes = jpeg(300, 200);
+    let e = t.send(put("x.jpg", bytes.clone())).await.json();
+    assert_eq!(t.send(put("again.jpg", bytes)).await.status, 200);
+    let id = e["id"].as_str().unwrap();
+    assert_eq!(
+        t.json(
+            "PATCH",
+            &format!("/v1/entries/{id}"),
+            json!({"name": "y.jpg"})
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        t.send(
+            t.req("DELETE", &format!("/v1/entries/{id}"))
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .status,
+        204
+    );
+    // A refused request.
+    let r = t
+        .send(
+            Request::get(format!("/v1/entries/{fid}"))
+                .header(header::AUTHORIZATION, "Bearer wp_nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 401);
+    // The denied row is written off the request path; give it a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let rows = wirephoto::audit::list(&t.app.db, 0, None, None, 100).unwrap();
+    let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(
+        ops,
+        ["upload", "upload", "move", "delete", "denied"],
+        "{rows:#?}"
+    );
+    assert_eq!(rows[0].status, 201);
+    assert_eq!(rows[1].status, 200, "the second upload stored nothing");
+    assert!(rows[1].detail.contains("already there as x.jpg"));
+    assert!(rows[2].detail.contains("2026/x.jpg -> 2026/y.jpg"));
+    assert!(rows[..4].iter().all(|r| r.key.as_deref() == Some("lith")));
+    assert_eq!(rows[4].status, 401);
+    assert!(rows[4].key.is_none());
+}
+
+/// A JPEG whose header is fine (so its facts are read) but whose quantisation table is bogus: the decoder's
+/// verdict, not an accident.
+fn broken_jpeg() -> Vec<u8> {
+    let mut b = vec![
+        0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8, 0, 200, 1, 44, 1, 1, 0x11, 0,
+    ];
+    b.extend_from_slice(&[0xFF, 0xDB, 0, 67, 0x0F]);
+    b.extend_from_slice(&[1u8; 64]);
+    b.extend_from_slice(&[0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0, 1, 2, 3, 0xFF, 0xD9]);
+    b
+}
+
+#[tokio::test]
+async fn a_file_the_decoder_rejects_is_unpreviewable_for_good() {
+    let t = setup().await;
+    std::fs::write(t.lib.join("2026/broken.jpg"), broken_jpeg()).unwrap();
+    rescan(&t).await;
+    let row = row_at(&t, "2026/broken.jpg").unwrap();
+    assert!(
+        !row.previewable,
+        "the decoder's verdict is final, not retried at every start"
+    );
+    assert_eq!(
+        t.app
+            .db
+            .read(|c| Ok(c.query_row(
+                "SELECT preview_done FROM entries WHERE id = ?",
+                [&row.id],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn pause_holds_background_work_and_resume_releases_it() {
+    let t = setup().await;
+    wirephoto::indexer::set_paused(&t.app.db, true).unwrap();
+    std::fs::write(t.lib.join("2026/new.jpg"), jpeg(500, 400)).unwrap();
+    let (a, l) = (t.app.clone(), t.app.libraries[0].clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::spawn(wirephoto::indexer::background(t.app.clone()));
+    let read = || row_at(&t, "2026/new.jpg").unwrap().media_state != 0;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        row_at(&t, "2026/new.jpg").is_some(),
+        "listed even while paused"
+    );
+    assert!(!read(), "but its facts wait");
+    wirephoto::indexer::set_paused(&t.app.db, false).unwrap();
+    let mut done = false;
+    for _ in 0..100 {
+        if read() {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(done, "resumed within the check interval");
+}
+
+#[tokio::test]
+async fn background_work_steps_aside_while_the_api_is_busy() {
+    let t = setup_with("[background]\nyield_seconds = 1\n").await;
+    std::fs::write(t.lib.join("2026/new.jpg"), jpeg(500, 400)).unwrap();
+    let (a, l) = (t.app.clone(), t.app.libraries[0].clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l))
+        .await
+        .unwrap()
+        .unwrap();
+    // A request: hashing waits for the API to go idle.
+    assert_eq!(t.get("/v1/libraries").await.status, 200);
+    assert!(t.app.api_busy());
+    wirephoto::indexer::settle(&t.app).await.unwrap();
+    assert!(
+        row_at(&t, "2026/new.jpg").unwrap().sha256.is_none(),
+        "not hashed while busy"
+    );
+    let row = row_at(&t, "2026/new.jpg").unwrap();
+    assert!(
+        t.app
+            .previews
+            .disk()
+            .contains(&wirephoto::preview::key(&row, 640))
+            .unwrap(),
+        "previews still go on, one at a time"
+    );
+    // Idle again.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(!t.app.api_busy());
+    wirephoto::indexer::settle(&t.app).await.unwrap();
+    assert!(row_at(&t, "2026/new.jpg").unwrap().sha256.is_some());
+}

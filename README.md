@@ -34,6 +34,19 @@ docker compose exec wirephoto wirephoto keys create --name lith --scope write --
 
 The key is printed once. `wirephoto keys list` and `wirephoto keys revoke <name>` manage them.
 
+Keeping an eye on it (all run where the server runs, e.g. `docker compose exec wirephoto wirephoto status`):
+
+| Command | |
+|---|---|
+| `wirephoto status` | Each library's progress, speed and time left; how long previews take by file type; cache and workers |
+| `wirephoto audit [--since 7d] [--key NAME] [--op OP]` | The audit trail: uploads, moves, deletes, restores, refused requests, key changes |
+| `wirephoto pause` / `resume` | Hold background work (reading files, previews, hashing), also across restarts |
+| `wirephoto cache stats\|list\|extract DIR` | Look inside the preview cache |
+
+The log (`docker logs`, and a file a day in `<data>/logs`) has a progress line every 30 seconds while there is
+work, one line per API request, and the audit trail. Background work never holds up requests: it runs at low CPU
+priority, and while the API is in use previews go one at a time and hashing waits.
+
 Browser apps on `https://` can only reach an `https://` server: give wirephoto a certificate (`[tls]` in the
 config; `tailscale cert` makes one for a tailnet name) or put a TLS-terminating reverse proxy in front.
 

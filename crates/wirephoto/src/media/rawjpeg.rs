@@ -153,6 +153,17 @@ fn tiff_orientation(b: &[u8]) -> u8 {
 
 /// Finds the largest decodable embedded JPEG. Never fails on a malformed file; `Ok(None)` when there is none.
 pub fn find_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Option<Embedded>> {
+    Ok(collect(f, false)?.into_iter().next())
+}
+
+/// Every embedded JPEG big enough for a preview, largest first, the file's structure AND a scan of its start
+/// both searched: what to try when the first choice turns out not to decode (some cameras' maker notes point
+/// at a damaged or differently encoded one).
+pub fn all_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Vec<Embedded>> {
+    collect(f, true)
+}
+
+fn collect(f: &(impl ReadAt + ?Sized), scan_always: bool) -> std::io::Result<Vec<Embedded>> {
     let size = f.size();
     let head = f.read_at(0, HEAD as u64)?;
     let mut spans = Vec::new();
@@ -167,15 +178,13 @@ pub fn find_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Option<Embed
         orientation = o;
     }
 
-    let mut best: Option<Candidate> = None;
-    fn consider(best: &mut Option<Candidate>, c: Candidate) {
-        if c.info.width.max(c.info.height) < MIN_EDGE {
+    let mut found: Vec<Candidate> = Vec::new();
+    fn consider(found: &mut Vec<Candidate>, c: Candidate) {
+        if c.info.width.max(c.info.height) < MIN_EDGE || found.iter().any(|f| f.offset == c.offset)
+        {
             return;
         }
-        let area = |c: &Candidate| c.info.width as u64 * c.info.height as u64;
-        if best.as_ref().is_none_or(|b| area(&c) > area(b)) {
-            *best = Some(c);
-        }
+        found.push(c);
     }
     for (offset, length) in spans {
         if !(offset > 0 && length > 4 && offset.saturating_add(length) <= size) {
@@ -188,7 +197,7 @@ pub fn find_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Option<Embed
         };
         if let Some(info) = jpeg::info(&probe) {
             consider(
-                &mut best,
+                &mut found,
                 Candidate {
                     offset,
                     length,
@@ -197,14 +206,14 @@ pub fn find_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Option<Embed
             );
         }
     }
-    if best.is_none() {
+    if found.is_empty() || scan_always {
         let bytes = if size as usize <= head.len() {
             head.clone()
         } else {
             f.read_at(0, SCAN as u64)?
         };
         for c in scan_candidates(&bytes) {
-            consider(&mut best, c);
+            consider(&mut found, c);
         }
         // CR3 keeps the orientation in its CMT1 box (a TIFF IFD0).
         if orientation == 0 {
@@ -214,17 +223,22 @@ pub fn find_embedded(f: &(impl ReadAt + ?Sized)) -> std::io::Result<Option<Embed
             }
         }
     }
-    Ok(best.map(|b| Embedded {
-        offset: b.offset,
-        length: b.length,
-        width: b.info.width,
-        height: b.info.height,
-        orientation: if b.info.orientation != 0 {
-            b.info.orientation
-        } else {
-            orientation.max(1)
-        },
-    }))
+    let area = |c: &Candidate| c.info.width as u64 * c.info.height as u64;
+    found.sort_by_key(|c| std::cmp::Reverse(area(c)));
+    Ok(found
+        .into_iter()
+        .map(|b| Embedded {
+            offset: b.offset,
+            length: b.length,
+            width: b.info.width,
+            height: b.info.height,
+            orientation: if b.info.orientation != 0 {
+                b.info.orientation
+            } else {
+                orientation.max(1)
+            },
+        })
+        .collect())
 }
 
 #[cfg(test)]

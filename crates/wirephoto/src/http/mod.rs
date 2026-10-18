@@ -145,6 +145,99 @@ fn cors(app: Arc<App>) -> CorsLayer {
         .allow_private_network(true)
 }
 
+/// The access log: one line per request (`wirephoto::access`, `[log] access`), with how long the response took
+/// to start (a long download or stream goes on after), its size when known, the key and the client. Refused
+/// requests (401, 403) also go to the audit trail. A URL's signature is never written down.
+async fn access_log(
+    State(app): State<Arc<App>>,
+    mut req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let started = Instant::now();
+    let client = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let info = crate::audit::RequestInfo {
+        client,
+        ..Default::default()
+    };
+    req.extensions_mut().insert(info.clone());
+    let method = req.method().clone();
+    let path = redacted(req.uri());
+    // Requests come first: background work slows down while the API is in use. Health checks and the live
+    // changes stream (an app keeps it open) do not count.
+    let counts = !(path == "/healthz" || path.starts_with("/v1/changes"));
+    if counts {
+        app.api_active();
+    }
+    let res = next.run(req).await;
+    if counts {
+        app.api_active();
+    }
+    let status = res.status().as_u16();
+    let ms = started.elapsed().as_millis() as u64;
+    if app.config.log.access {
+        // A whole body knows its length; a stream (downloads, batches, live changes) does not yet.
+        let size = res
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| axum::body::HttpBody::size_hint(res.body()).exact())
+            .map(human_bytes)
+            .unwrap_or_else(|| "-".into());
+        tracing::info!(
+            target: "wirephoto::access",
+            "{method} {path} {status} {ms} ms {size} key={} client={}",
+            info.key_name().unwrap_or("-"),
+            client.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+        );
+    }
+    if status == 401 || status == 403 {
+        let app = app.clone();
+        let detail = format!("{method} {path}");
+        let info2 = info.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::audit::record(
+                &app,
+                crate::audit::Event::new("denied", detail)
+                    .by(Some(&info2), None)
+                    .status(status),
+            )
+        });
+    }
+    res
+}
+
+/// The request's path and query, with any `sig` replaced: a signature in a log is a key to that file.
+fn redacted(uri: &axum::http::Uri) -> String {
+    match uri.query() {
+        None => uri.path().to_string(),
+        Some(q) => {
+            let q: Vec<String> = q
+                .split('&')
+                .map(|kv| {
+                    if kv.starts_with("sig=") {
+                        "sig=…".to_string()
+                    } else {
+                        kv.to_string()
+                    }
+                })
+                .collect();
+            format!("{}?{}", uri.path(), q.join("&"))
+        }
+    }
+}
+
+fn human_bytes(b: u64) -> String {
+    match b {
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
+}
+
 async fn cross_origin_headers(
     req: axum::extract::Request,
     next: middleware::Next,
@@ -197,6 +290,7 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app.clone());
     let _ = app.router.set(api.clone());
     api.layer(middleware::from_fn(cross_origin_headers))
+        .layer(middleware::from_fn_with_state(app.clone(), access_log))
         .layer(cors(app))
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }

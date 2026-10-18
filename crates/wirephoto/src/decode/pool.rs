@@ -47,6 +47,8 @@ pub struct Pool {
     lost: AtomicU64,
     /// Workers lost since the last good reply.
     in_a_row: AtomicU64,
+    /// CPU priority the workers lower themselves to (`nice`): 0, or more for background work.
+    nice: i32,
 }
 
 /// How long a worker may take over one image, and over one video.
@@ -56,6 +58,12 @@ const VIDEO_TIMEOUT: Duration = Duration::from_secs(120);
 impl Pool {
     /// A pool of up to `max` workers running `program decode`; `tools` are ffmpeg and ffprobe, if found.
     pub fn new(program: PathBuf, max: usize, tools: Option<Tools>) -> Pool {
+        Self::with_nice(program, max, tools, 0)
+    }
+
+    /// The same, with workers that run at a lower CPU priority (`nice`): the kernel gives the CPU to other work
+    /// first, so background renderings use what requests leave over.
+    pub fn with_nice(program: PathBuf, max: usize, tools: Option<Tools>, nice: i32) -> Pool {
         Pool {
             program,
             max: max.max(1),
@@ -68,6 +76,7 @@ impl Pool {
             spawned: AtomicU64::new(0),
             lost: AtomicU64::new(0),
             in_a_row: AtomicU64::new(0),
+            nice,
         }
     }
 
@@ -182,7 +191,11 @@ impl Pool {
 
     fn spawn(&self) -> anyhow::Result<Worker> {
         let (ours, theirs) = UnixStream::pair()?;
-        let child = Command::new(&self.program)
+        let mut cmd = Command::new(&self.program);
+        if self.nice > 0 {
+            cmd.env("WIREPHOTO_WORKER_NICE", self.nice.to_string());
+        }
+        let child = cmd
             .arg("decode")
             .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
             .stdout(Stdio::null())

@@ -50,6 +50,13 @@ fn check_origin(headers: &HeaderMap, key: &KeyRow) -> Result<(), ApiError> {
     }
 }
 
+/// Tells the access log and the audit trail who this is.
+fn note_key(parts: &Parts, key: &KeyRow) {
+    if let Some(info) = parts.extensions.get::<crate::audit::RequestInfo>() {
+        let _ = info.key.set(key.name.clone());
+    }
+}
+
 async fn by_token(app: &Arc<App>, token: String) -> Result<KeyRow, ApiError> {
     let a = app.clone();
     let key = tokio::task::spawn_blocking(move || {
@@ -75,6 +82,7 @@ impl FromRequestParts<Arc<App>> for Caller {
             .to_string();
         let key = by_token(app, token).await?;
         check_origin(&parts.headers, &key)?;
+        note_key(parts, &key);
         Ok(Caller(key))
     }
 }
@@ -91,7 +99,11 @@ impl FromRequestParts<Arc<App>> for MaybeCaller {
     ) -> Result<Self, Self::Rejection> {
         match bearer(&parts.headers) {
             None => Ok(MaybeCaller(None)),
-            Some(t) => Ok(MaybeCaller(Some(by_token(app, t.to_string()).await?))),
+            Some(t) => {
+                let key = by_token(app, t.to_string()).await?;
+                note_key(parts, &key);
+                Ok(MaybeCaller(Some(key)))
+            }
         }
     }
 }
@@ -110,6 +122,7 @@ impl FromRequestParts<Arc<App>> for ByteCaller {
         if let Some(t) = bearer(&parts.headers) {
             let key = by_token(app, t.to_string()).await?;
             check_origin(&parts.headers, &key)?;
+            note_key(parts, &key);
             return Ok(ByteCaller(key));
         }
         let entry = parts
@@ -137,6 +150,7 @@ impl FromRequestParts<Arc<App>> for ByteCaller {
         if parts.headers.contains_key(header::ORIGIN) {
             check_origin(&parts.headers, &key)?;
         }
+        note_key(parts, &key);
         Ok(ByteCaller(key))
     }
 }

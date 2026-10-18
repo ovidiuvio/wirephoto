@@ -31,3 +31,14 @@ pregenerate = true       # make the 640 px preview of every photo ahead of time
 # [decode]
 # workers = 0            # previews rendered at once (half of them for pre-generation); 0: one per CPU
 # ffmpeg = "/usr/bin/ffmpeg"  # video posters and durations (ffprobe next to it); default: from PATH
+
+# Background work (reading files, previews, hashing) runs at low priority: its decode workers yield the CPU to
+# requests', and while the API is in use previews go one at a time and hashing waits.
+# [background]
+# yield_seconds = 10     # how long the API must be idle before full speed again; 0: never slow down
+
+# [log]
+# file = true            # also log to <data>/logs/wirephoto.log.<date> (survives a recreated container)
+# keep_days = 14         # log files kept
+# access = true          # one line per API request: method, path, status, time, size, key, client
+# audit_days = 365       # audit trail kept in the index (`wirephoto audit`)

@@ -129,6 +129,14 @@ impl Source {
 
 /// `wirephoto decode`: serves requests on stdin until the server closes it.
 pub fn worker_main() -> anyhow::Result<()> {
+    // A background worker steps aside for everything else: raising one's own niceness needs no privilege.
+    #[cfg(unix)]
+    if let Some(n) = std::env::var("WIREPHOTO_WORKER_NICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = rustix::process::nice(n);
+    }
     sandbox::enter().context("entering the sandbox")?;
     // SAFETY: the server gives the worker one end of a socket pair as its stdin, and nothing else uses fd 0.
     let mut sock = unsafe { UnixStream::from_raw_fd(0) };

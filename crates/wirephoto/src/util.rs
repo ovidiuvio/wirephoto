@@ -59,6 +59,13 @@ pub fn folder_etag(library: &str, path: &str) -> String {
     hex::encode(&h.finalize()[..8])
 }
 
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

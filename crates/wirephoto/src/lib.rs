@@ -1,6 +1,7 @@
 //! wirephoto: serves the photos on a machine's own disks to apps over HTTP (docs/design.md).
 
 pub mod app;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -49,9 +50,15 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
             Some(t) => tracing::info!(ffmpeg = %t.ffmpeg.display(), "video posters on"),
             None => tracing::warn!("ffmpeg/ffprobe not found: videos get no posters or durations"),
         }
-        // Interactive renderings, background ones (a quarter), and a probe.
-        Arc::new(decode::Pool::new(program, n + (n / 4).max(1) + 1, tools))
+        // Requests' renderings and a probe; background ones get their own workers (half as many, and a probe)
+        // at low CPU priority, so they use what requests leave over and never hold up a request's turn.
+        let bg = decode::Pool::with_nice(program.clone(), (n / 2).max(1) + 1, tools.clone(), 10);
+        (
+            Arc::new(decode::Pool::new(program, n + 1, tools)),
+            Arc::new(bg),
+        )
     };
+    let (pool, bg_pool) = pool;
     if pool.has_video() {
         // Videos read while ffmpeg was missing: read them again.
         db.write(|t| {
@@ -84,12 +91,14 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
         config,
         db,
         libraries,
-        previews: Arc::new(preview::Previews::new(disk, pool, workers, memory)),
+        previews: Arc::new(preview::Previews::new(disk, pool, bg_pool, workers, memory)),
         keys,
         seq: tokio::sync::watch::channel(seq).0,
         work: tokio::sync::Notify::new(),
         router: std::sync::OnceLock::new(),
         origins: RwLock::new((long_ago, Vec::new())),
+        api_activity: std::sync::atomic::AtomicI64::new(0),
+        yielding: std::sync::atomic::AtomicBool::new(false),
     });
     // The root IDs of libraries indexed before, so they are known before the scan finishes.
     for lib in &app.libraries {

@@ -24,6 +24,70 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub decode: DecodeConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default)]
+    pub background: BackgroundConfig,
+}
+
+/// Background work: reading files, making previews, hashing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundConfig {
+    /// Requests come first: background work pauses while the API is in use and resumes once it has had no
+    /// request for this many seconds. 0: never pause.
+    #[serde(default = "default_yield_seconds")]
+    pub yield_seconds: u64,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        BackgroundConfig {
+            yield_seconds: default_yield_seconds(),
+        }
+    }
+}
+
+fn default_yield_seconds() -> u64 {
+    10
+}
+
+/// Logging and the audit trail.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// Also write the log to `<data>/logs/wirephoto.log.<date>`, a file a day (it survives a recreated
+    /// container, which the container's own log does not).
+    #[serde(default = "yes")]
+    pub file: bool,
+    /// Days of log files kept.
+    #[serde(default = "default_keep_days")]
+    pub keep_days: usize,
+    /// One line per API request: method, path, status, time, size, key, client.
+    #[serde(default = "yes")]
+    pub access: bool,
+    /// Days the audit trail (changes, refused requests, key changes; `wirephoto audit`) is kept in the index.
+    #[serde(default = "default_audit_days")]
+    pub audit_days: u32,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            file: true,
+            keep_days: default_keep_days(),
+            access: true,
+            audit_days: default_audit_days(),
+        }
+    }
+}
+
+fn default_keep_days() -> usize {
+    14
+}
+
+fn default_audit_days() -> u32 {
+    365
 }
 
 /// The decode workers (design.md, Architecture).
