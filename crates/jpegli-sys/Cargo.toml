@@ -1,0 +1,11 @@
+[package]
+name = "jpegli-sys"
+description = "jpegli (github.com/google/jpegli), vendored and statically linked, behind a one-call RGB-to-JPEG shim"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND BSD-3-Clause AND Apache-2.0"
+links = "jpegli"
+include = ["src", "shim", "vendor", "build.rs", "CMakeLists.txt"]
+
+[build-dependencies]
+cmake = "0.1.54"

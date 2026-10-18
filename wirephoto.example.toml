@@ -1,0 +1,33 @@
+# wirephoto configuration. Mount your own over /etc/wirephoto.toml.
+
+# Where apps reach the server (informational; URLs in responses are relative).
+# public_url = "https://photos.home.example.com"
+listen = "0.0.0.0:8443"
+
+# Index, preview cache and server secret. Put it on an SSD.
+data = "/data"
+
+# Browser apps on https:// can only reach an https:// server. Either give wirephoto a certificate
+# (from ACME or `tailscale cert`) or put a TLS-terminating reverse proxy in front and leave this out.
+# [tls]
+# cert = "/data/tls/cert.pem"
+# key = "/data/tls/key.pem"
+
+[[library]]
+id = "photos"            # its API ID is lib_photos
+name = "Photos"
+path = "/photos"
+read_only = false
+trash_days = 30          # 0: deletes are permanent
+watch = "auto"           # auto | poll (use poll for NFS/SMB mounts)
+poll_seconds = 60
+
+[cache]
+max_size = "50GB"        # preview cache on disk, all sizes: 640 px ~35 GB per million photos, 2560 px ~0.3-1 MB each
+memory = "256MB"         # previews kept in memory in front of it (a 640 px preview is ~35 KB)
+pregenerate = true       # make the 640 px preview of every photo ahead of time
+
+# Previews are decoded in sandboxed `wirephoto decode` worker processes.
+# [decode]
+# workers = 0            # previews rendered at once; 0: one per CPU
+# ffmpeg = "/usr/bin/ffmpeg"  # video posters and durations (ffprobe next to it); default: from PATH

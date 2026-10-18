@@ -1,0 +1,24 @@
+# wirephoto on a NAS.
+#
+#   docker compose up -d
+#   docker compose exec wirephoto wirephoto keys create --name lith --scope write --origin https://lith.example.com
+#
+# Adjust the photo and data paths, and `user` to the owner of your photo share (on Synology: `id <user>`).
+
+services:
+  wirephoto:
+    image: ghcr.io/ovidiuvio/wirephoto:latest
+    container_name: wirephoto
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./wirephoto.toml:/etc/wirephoto.toml:ro
+      - /volume1/photos:/photos              # the library (add :ro and read_only = true to serve it read-only)
+      - /volume1/docker/wirephoto:/data      # index and preview cache: an SSD if you have one
+    environment:
+      WIREPHOTO_LOG: "wirephoto=info"
+    restart: unless-stopped

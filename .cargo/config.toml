@@ -1,0 +1,6 @@
+# Local macOS development: use Homebrew's libjpeg-turbo instead of building it (Homebrew keeps its pkg-config
+# file out of the default search path). The Docker build sets TURBOJPEG_SOURCE=vendor, which wins: [env] never
+# overrides a variable that is already set.
+[env]
+TURBOJPEG_SOURCE = "pkg-config"
+PKG_CONFIG_PATH = "/opt/homebrew/opt/jpeg-turbo/lib/pkgconfig"

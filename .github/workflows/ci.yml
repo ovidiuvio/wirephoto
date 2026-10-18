@@ -1,0 +1,135 @@
+# Tests, then the Docker image for linux/amd64 and linux/arm64, each built natively on its own runner and merged
+# into one multi-arch image on GitHub Container Registry.
+#
+#   push to main  -> ghcr.io/<owner>/wirephoto:main, :sha-<short>
+#   tag v1.2.3    -> :1.2.3, :1.2, :1, :latest
+#   pull request  -> tests and an image build, nothing pushed
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/wirephoto
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      TURBOJPEG_SOURCE: vendor
+      TURBOJPEG_STATIC: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm pkg-config libheif-dev libheif-plugin-libde265 ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets
+
+  image:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: arch
+        run: echo "name=${PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+          cache-from: type=gha,scope=${{ steps.arch.outputs.name }}
+          cache-to: type=gha,mode=max,scope=${{ steps.arch.outputs.name }}
+      - if: github.event_name != 'pull_request'
+        name: Keep the digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.arch.outputs.name }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          flavor: |
+            latest=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Inspect
+        run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"

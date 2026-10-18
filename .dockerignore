@@ -1,0 +1,9 @@
+target
+bench-out
+.git
+.github
+docs
+scripts
+**/*.redb
+**/*.db
+.cargo

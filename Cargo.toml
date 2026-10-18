@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/wirephoto", "crates/wirephoto-api", "crates/jpegli-sys"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ovidiuvio/wirephoto"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
