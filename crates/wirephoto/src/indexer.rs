@@ -679,6 +679,17 @@ fn log_preview_failure(lib: &str, path: &str, e: &anyhow::Error, permanent: bool
     }
 }
 
+static HASH_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn log_hash_failure(lib: &str, path: &str, why: &str) {
+    let n = HASH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= FAILURES_LOGGED || n.is_multiple_of(100) {
+        tracing::warn!(library = %lib, path = %path, failures = n, "cannot hash, retried after a restart: {why}");
+    } else {
+        tracing::debug!(library = %lib, path = %path, "cannot hash: {why}");
+    }
+}
+
 async fn preview_pass(app: &Arc<App>) -> anyhow::Result<usize> {
     if !app.config.cache.pregenerate {
         return Ok(0);
@@ -797,8 +808,8 @@ pub fn hash_entry(app: &App, row: &EntryRow) -> anyhow::Result<Option<[u8; 32]>>
 fn hash_pass(app: &App) -> anyhow::Result<usize> {
     let rows: Vec<EntryRow> = app.db.read(|c| {
         let mut st = c.prepare(&format!(
-            "SELECT {} FROM {} WHERE e.sha256 IS NULL AND e.kind != 0 AND e.trashed_at IS NULL AND e.missing = 0
-             ORDER BY e.dev, e.ino LIMIT 8",
+            "SELECT {} FROM {} WHERE e.sha256 IS NULL AND e.hash_deferred = 0 AND e.kind != 0 AND e.trashed_at IS NULL
+             AND e.missing = 0 ORDER BY e.dev, e.ino LIMIT 8",
             db::ENTRY_COLS,
             db::ENTRY_FROM
         ))?;
@@ -810,8 +821,22 @@ fn hash_pass(app: &App) -> anyhow::Result<usize> {
         if app.api_busy() {
             break; // the rest after the API goes idle
         }
-        if let Err(e) = hash_entry(app, row) {
-            tracing::debug!(entry = %row.id, "hash failed: {e:#}");
+        // A file that cannot be hashed is set aside until the next start: picked again at once, it would be
+        // the same few files every pass, forever, and nothing else would be hashed.
+        let failed = match hash_entry(app, row) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some("it changed while being read".to_string()),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(why) = failed {
+            log_hash_failure(&row.library, &row.path, &why);
+            app.db.write(|t| {
+                t.execute(
+                    "UPDATE entries SET hash_deferred = 1 WHERE rowid = ?",
+                    [row.rowid],
+                )?;
+                Ok(())
+            })?;
         }
         n += 1;
     }
@@ -1074,7 +1099,7 @@ pub fn retry_failed_previews(app: &App) -> anyhow::Result<()> {
         let deferred = t.execute(
             "UPDATE entries SET preview_done = ? WHERE preview_done = ?",
             params![PREVIEW_PENDING, PREVIEW_DEFERRED],
-        )?;
+        )? + t.execute("UPDATE entries SET hash_deferred = 0 WHERE hash_deferred = 1", [])?;
         let rechecked = if first {
             t.execute(
                 "UPDATE entries SET media_state = 0, preview_done = 0 WHERE kind IN (1, 2, 3) AND previewable = 0",
@@ -1106,6 +1131,7 @@ pub async fn report(app: Arc<App>) {
         deferred: u64,
         not_previewable: u64,
         hashes_pending: u64,
+        hash_failed: u64,
     }
     const EVERY: Duration = Duration::from_secs(30);
     let mut last: HashMap<String, (Counts, bool, u64)> = HashMap::new();
@@ -1143,7 +1169,8 @@ pub async fn report(app: Arc<App>) {
                             COALESCE(SUM(previewable = 1 AND preview_done = 1), 0),
                             COALESCE(SUM(preview_done = 2), 0),
                             COALESCE(SUM(kind IN (1, 2, 3) AND media_state != 0 AND previewable = 0), 0),
-                            COALESCE(SUM(kind != 0 AND sha256 IS NULL), 0)
+                            COALESCE(SUM(kind != 0 AND sha256 IS NULL AND hash_deferred = 0), 0),
+                            COALESCE(SUM(kind != 0 AND sha256 IS NULL AND hash_deferred = 1), 0)
                      FROM entries WHERE library = ? AND trashed_at IS NULL AND missing = 0",
                     [&lib_id],
                     |r| {
@@ -1155,6 +1182,7 @@ pub async fn report(app: Arc<App>) {
                             deferred: r.get::<_, i64>(4)? as u64,
                             not_previewable: r.get::<_, i64>(5)? as u64,
                             hashes_pending: r.get::<_, i64>(6)? as u64,
+                            hash_failed: r.get::<_, i64>(7)? as u64,
                         })
                     },
                 )?)
@@ -1235,14 +1263,19 @@ pub async fn report(app: Arc<App>) {
                 tracing::info!("{id}: {line}");
                 lines.push((id.clone(), line));
             } else {
-                let deferred = if now.deferred > 0 {
-                    format!(
-                        ", {} failed and retried after a restart",
+                let mut deferred = String::new();
+                if now.deferred > 0 {
+                    deferred.push_str(&format!(
+                        ", {} previews failed (retried after a restart)",
                         thousands(now.deferred)
-                    )
-                } else {
-                    String::new()
-                };
+                    ));
+                }
+                if now.hash_failed > 0 {
+                    deferred.push_str(&format!(
+                        ", {} files could not be hashed (retried after a restart)",
+                        thousands(now.hash_failed)
+                    ));
+                }
                 let line = format!(
                     "up to date: {} files, {} previews, {} not previewable{deferred}",
                     thousands(now.files),
@@ -1298,7 +1331,7 @@ fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Sna
     let (a, b) = (p.pool().stats(), p.bg_pool().stats());
     let (workers_started, workers_lost) = (a.0 + b.0, a.1 + b.1);
     Snapshot {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::version(),
         started,
         time: crate::util::now_secs(),
         libraries: app

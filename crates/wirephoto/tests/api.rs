@@ -1716,9 +1716,41 @@ async fn hashing_runs_beside_previews_not_after_them() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(app.previews.disk().total_bytes(), 0, "the preview is still stuck");
+    assert_eq!(
+        app.previews.disk().total_bytes(),
+        0,
+        "the preview is still stuck"
+    );
     assert!(
         hashed,
         "yet the file is hashed: hashing does not wait for previews"
     );
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_hashed_does_not_stop_the_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = setup().await;
+    std::fs::write(t.lib.join("2026/locked.jpg"), jpeg(300, 200)).unwrap();
+    std::fs::write(t.lib.join("2026/open.jpg"), jpeg(320, 200)).unwrap();
+    std::fs::set_permissions(
+        t.lib.join("2026/locked.jpg"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    // Settles (it used to pick the unreadable file again on every pass, for ever).
+    tokio::time::timeout(std::time::Duration::from_secs(20), rescan(&t))
+        .await
+        .expect("the background passes finish");
+    assert!(row_at(&t, "2026/open.jpg").unwrap().sha256.is_some());
+    assert!(row_at(&t, "2026/locked.jpg").unwrap().sha256.is_none());
+    // Readable again: the next start retries it.
+    std::fs::set_permissions(
+        t.lib.join("2026/locked.jpg"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    wirephoto::indexer::retry_failed_previews(&t.app).unwrap();
+    wirephoto::indexer::settle(&t.app).await.unwrap();
+    assert!(row_at(&t, "2026/locked.jpg").unwrap().sha256.is_some());
 }

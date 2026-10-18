@@ -11,6 +11,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# The commit, shown in the log and `wirephoto status` (CI passes it).
+ARG WIREPHOTO_COMMIT=
 ENV TURBOJPEG_SOURCE=vendor \
     TURBOJPEG_STATIC=1 \
     CARGO_TARGET_DIR=/src/target

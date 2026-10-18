@@ -15,6 +15,16 @@ pub mod preview;
 pub mod util;
 pub mod write;
 
+/// The version and the commit it was built from (CI passes `WIREPHOTO_COMMIT`): which image is running.
+pub fn version() -> String {
+    match option_env!("WIREPHOTO_COMMIT") {
+        Some(c) if !c.is_empty() => {
+            format!("{} ({})", env!("CARGO_PKG_VERSION"), &c[..c.len().min(7)])
+        }
+        _ => format!("{} (local build)", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 use std::sync::Arc;
 
 use anyhow::Context;

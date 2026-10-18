@@ -191,6 +191,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("listen = {:?}", config.listen))?;
     let tls = config.tls.clone();
+    tracing::info!("wirephoto {} starting", wirephoto::version());
     let (app, router) = wirephoto::build(config)?;
     wirephoto::start(&app);
     // With the client's address, for the access log and the audit trail.

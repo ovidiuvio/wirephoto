@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS entries (
     trash_root   INTEGER,
     orig_parent  INTEGER,
     orig_name    TEXT,
-    missing      INTEGER NOT NULL DEFAULT 0
+    missing      INTEGER NOT NULL DEFAULT 0,
+    -- hashing failed (unreadable, or changed while read): left until the next start, which retries it
+    hash_deferred INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS entries_path ON entries(library, path);
 CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent, name);
@@ -111,11 +113,26 @@ fn configure(c: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Columns added to the schema after indexes had been created with it: added to an older index on open.
+const ADDED_COLUMNS: &[(&str, &str)] = &[("entries", "hash_deferred INTEGER NOT NULL DEFAULT 0")];
+
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Db> {
         let writer = Connection::open(path)?;
         configure(&writer)?;
         writer.execute_batch(SCHEMA)?;
+        // Columns added since an index was created (CREATE TABLE IF NOT EXISTS leaves an old table alone).
+        for (table, column) in ADDED_COLUMNS {
+            let name = column.split(' ').next().unwrap_or(column);
+            let has: bool = writer.query_row(
+                &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?"),
+                [name],
+                |r| r.get(0),
+            )?;
+            if !has {
+                writer.execute(&format!("ALTER TABLE {table} ADD COLUMN {column}"), [])?;
+            }
+        }
         let manager = SqliteConnectionManager::file(path).with_init(|c| {
             c.busy_timeout(std::time::Duration::from_secs(10))?;
             c.pragma_update(None, "query_only", "ON")
@@ -360,7 +377,7 @@ pub fn update_file_stat(
     ino: u64,
 ) -> rusqlite::Result<()> {
     t.execute(
-        "UPDATE entries SET size = ?, mtime_ns = ?, dev = ?, ino = ?, sha256 = NULL, sort_taken = ?,
+        "UPDATE entries SET size = ?, mtime_ns = ?, dev = ?, ino = ?, sha256 = NULL, hash_deferred = 0, sort_taken = ?,
              media_state = CASE WHEN kind IN (1, 2, 3) THEN 0 ELSE 2 END, previewable = 0, preview_done = 0,
              width = NULL, height = NULL, orientation = NULL, taken = NULL, duration = NULL
          WHERE rowid = ?",
@@ -449,5 +466,37 @@ pub fn current_seq(c: &Connection) -> rusqlite::Result<i64> {
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
         Err(rusqlite::Error::SqliteFailure(_, Some(m))) if m.contains("no such table") => Ok(0),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    #[test]
+    fn an_older_index_gains_new_columns() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("index.db");
+        // The schema as it was before `hash_deferred`.
+        let old = super::SCHEMA.replace(
+            ",\n    -- hashing failed (unreadable, or changed while read): left until the next start, which retries it\n    hash_deferred INTEGER NOT NULL DEFAULT 0",
+            "",
+        );
+        assert_ne!(old, super::SCHEMA);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(&old)
+            .unwrap();
+        let db = super::Db::open(&path).unwrap();
+        let has: bool = db
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('entries') WHERE name = 'hash_deferred'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(has);
+        drop(db);
+        super::Db::open(&path).unwrap(); // and opening again is fine
     }
 }
