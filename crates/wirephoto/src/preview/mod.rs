@@ -56,8 +56,44 @@ pub struct Previews {
     renders: Arc<AtomicU64>,
 }
 
+/// A preview's cache key. Once a file's hash is known its previews are keyed by CONTENT (`sha256-<hex>:<size>`),
+/// so copies of a photo share one set; before that by entry and version (`<entry id>:<etag>:<size>`). The
+/// indexer moves them over when it hashes a file ([`Previews::adopt_hash`]); uploads and API copies know the
+/// hash from the start.
 pub fn key(entry: &EntryRow, size: u32) -> String {
+    match entry.sha256.as_deref() {
+        Some(h) if h.len() == 32 => content_key(h, size),
+        _ => entry_key(entry, size),
+    }
+}
+
+fn content_key(hash: &[u8], size: u32) -> String {
+    format!("sha256-{}:{size}", hex::encode(hash))
+}
+
+fn entry_key(entry: &EntryRow, size: u32) -> String {
     format!("{}:{}:{}", entry.id, entry.etag(), size)
+}
+
+/// What a cache key names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyOf {
+    /// Content hash, size.
+    Content([u8; 32], u32),
+    /// Entry id, etag, size.
+    Entry(String, String, u32),
+}
+
+pub fn parse_key(key: &str) -> Option<KeyOf> {
+    let (rest, size) = key.rsplit_once(':')?;
+    let size = size.parse().ok()?;
+    if let Some(h) = rest.strip_prefix("sha256-") {
+        let mut hash = [0u8; 32];
+        hex::decode_to_slice(h, &mut hash).ok()?;
+        return Some(KeyOf::Content(hash, size));
+    }
+    let (id, etag) = rest.split_once(':')?;
+    Some(KeyOf::Entry(id.to_string(), etag.to_string(), size))
 }
 
 pub fn valid_size(size: u32) -> bool {
@@ -211,6 +247,16 @@ impl Previews {
         Ok(self.renders() > before && res.is_fresh())
     }
 
+    /// A file was just hashed: its entry-keyed previews move to the content key, or are dropped where a copy's
+    /// are there already (blocking).
+    pub fn adopt_hash(&self, before: &EntryRow, hash: &[u8; 32]) -> anyhow::Result<()> {
+        let moves: Vec<(String, String)> = SIZES
+            .iter()
+            .map(|&s| (entry_key(before, s), content_key(hash, s)))
+            .collect();
+        self.disk.rekey(&moves)
+    }
+
     async fn on_disk(&self, k: &str) -> anyhow::Result<bool> {
         let (disk, k) = (self.disk.clone(), k.to_string());
         tokio::task::spawn_blocking(move || disk.contains(&k)).await?
@@ -304,6 +350,20 @@ pub fn render(pool: &Pool, entry: &EntryRow, src: &Source, size: u32) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_round_trip() {
+        let h = [7u8; 32];
+        assert_eq!(
+            parse_key(&content_key(&h, 640)),
+            Some(KeyOf::Content(h, 640))
+        );
+        assert_eq!(
+            parse_key("ent_k82Pq:3a9f0c1e:320"),
+            Some(KeyOf::Entry("ent_k82Pq".into(), "3a9f0c1e".into(), 320))
+        );
+        assert_eq!(parse_key("nonsense"), None);
+    }
 
     #[test]
     fn smaller_sizes_from_the_cached_one() {

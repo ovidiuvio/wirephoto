@@ -12,36 +12,18 @@ use redb::{
 };
 
 use super::cache::{META, PREVIEWS};
+use super::{KeyOf, parse_key};
 
-/// One cached preview: its key is `<entry id>:<etag>:<size>`.
+/// One cached preview.
 #[derive(Debug, Clone)]
 pub struct Cached {
-    pub entry: String,
-    pub etag: String,
+    pub key: String,
+    /// What the key names: a file's content (shared by its copies), or an entry's version.
+    pub of: KeyOf,
     pub size: u32,
     pub bytes: u64,
     /// Unix seconds.
     pub last_used: u64,
-}
-
-impl Cached {
-    pub fn key(&self) -> String {
-        format!("{}:{}:{}", self.entry, self.etag, self.size)
-    }
-
-    fn parse(key: &str, bytes: u64, last_used: u64) -> Option<Cached> {
-        let mut it = key.rsplitn(3, ':');
-        let size = it.next()?.parse().ok()?;
-        let etag = it.next()?.to_string();
-        let entry = it.next()?.to_string();
-        Some(Cached {
-            entry,
-            etag,
-            size,
-            bytes,
-            last_used,
-        })
-    }
 }
 
 enum Handle {
@@ -90,8 +72,18 @@ impl CacheReader {
         for item in meta.iter()? {
             let (k, m) = item?;
             let (bytes, used) = m.value();
-            if let Some(c) = Cached::parse(k.value(), bytes, used) {
-                out.push(c);
+            let key = k.value().to_string();
+            if let Some(of) = parse_key(&key) {
+                let size = match &of {
+                    KeyOf::Content(_, s) | KeyOf::Entry(_, _, s) => *s,
+                };
+                out.push(Cached {
+                    key,
+                    of,
+                    size,
+                    bytes,
+                    last_used: used,
+                });
             }
         }
         Ok(out)
@@ -123,16 +115,10 @@ mod tests {
         let r = CacheReader::open(&path).unwrap();
         assert!(r.snapshot());
         let mut all = r.list().unwrap();
-        all.sort_by(|a, b| a.entry.cmp(&b.entry));
+        all.sort_by(|a, b| a.key.cmp(&b.key));
         assert_eq!(all.len(), 2);
-        assert_eq!(
-            (all[0].entry.as_str(), all[0].etag.as_str(), all[0].size),
-            ("ent_a", "3a9f", 640)
-        );
-        assert_eq!(
-            r.get(&all[1].key()).unwrap().as_deref(),
-            Some(&b"jpeg-b"[..])
-        );
+        assert_eq!(all[0].of, KeyOf::Entry("ent_a".into(), "3a9f".into(), 640));
+        assert_eq!(r.get(&all[1].key).unwrap().as_deref(), Some(&b"jpeg-b"[..]));
         drop(r);
 
         // Closed: read in place.

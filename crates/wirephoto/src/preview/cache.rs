@@ -114,6 +114,88 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Renames keys `(from, to)`; where `to` exists already (a copy's preview), `from` is just removed.
+    pub fn rekey(&self, moves: &[(String, String)]) -> anyhow::Result<()> {
+        let mut w = self.db.begin_write()?;
+        w.set_durability(Durability::None)?;
+        let mut freed = 0u64;
+        let mut changed = false;
+        {
+            let mut meta = w.open_table(META)?;
+            let mut previews = w.open_table(PREVIEWS)?;
+            for (from, to) in moves {
+                let Some(bytes) = previews.remove(from.as_str())?.map(|v| v.value().to_vec())
+                else {
+                    continue;
+                };
+                let m = meta.remove(from.as_str())?.map(|v| v.value());
+                changed = true;
+                if previews.get(to.as_str())?.is_some() {
+                    freed += bytes.len() as u64;
+                } else {
+                    previews.insert(to.as_str(), bytes.as_slice())?;
+                    let used = m.map_or(crate::util::now_secs() as u64, |(_, used)| used);
+                    meta.insert(to.as_str(), (bytes.len() as u64, used))?;
+                }
+            }
+        }
+        w.commit()?;
+        if changed {
+            self.total.fetch_sub(freed, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Removes every preview whose key `keep` rejects, a batch at a time (blocking; for the periodic sweep).
+    /// Returns how many were removed.
+    pub fn retain(&self, mut keep: impl FnMut(&str) -> bool) -> anyhow::Result<u64> {
+        const BATCH: usize = 5000;
+        let mut after: Option<String> = None;
+        let mut removed = 0u64;
+        loop {
+            let keys: Vec<(String, u64)> = {
+                let r = self.db.begin_read()?;
+                let meta = r.open_table(META)?;
+                let range = match &after {
+                    Some(a) => meta.range::<&str>((
+                        std::ops::Bound::Excluded(a.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))?,
+                    None => meta.range::<&str>(..)?,
+                };
+                let mut v = Vec::with_capacity(BATCH);
+                for item in range.take(BATCH) {
+                    let (k, m) = item?;
+                    v.push((k.value().to_string(), m.value().0));
+                }
+                v
+            };
+            let Some(last) = keys.last().map(|k| k.0.clone()) else {
+                break;
+            };
+            let gone: Vec<(String, u64)> = keys.into_iter().filter(|(k, _)| !keep(k)).collect();
+            if !gone.is_empty() {
+                let mut w = self.db.begin_write()?;
+                {
+                    let mut meta = w.open_table(META)?;
+                    let mut previews = w.open_table(PREVIEWS)?;
+                    for (k, _) in &gone {
+                        meta.remove(k.as_str())?;
+                        previews.remove(k.as_str())?;
+                    }
+                }
+                w.set_durability(Durability::Immediate)?;
+                w.commit()?;
+                let bytes: u64 = gone.iter().map(|g| g.1).sum();
+                self.total.fetch_sub(bytes, Ordering::Relaxed);
+                removed += gone.len() as u64;
+            }
+            after = Some(last);
+        }
+        Ok(removed)
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
@@ -189,5 +271,25 @@ mod tests {
         drop(c);
         let c = DiskCache::open(&t.path().join("p.redb"), 1000, 640).unwrap();
         assert!(c.total_bytes() <= 900, "totals survive a reopen");
+    }
+
+    #[test]
+    fn rekey_shares_and_retain_removes() {
+        let t = tempfile::tempdir().unwrap();
+        let c = DiskCache::open(&t.path().join("p.redb"), 1 << 20, 640).unwrap();
+        c.put("ent_a:1:640", &[1u8; 100]).unwrap();
+        c.put("ent_b:2:640", &[1u8; 100]).unwrap();
+        // a is hashed first: moved; b (a copy) is hashed next: dropped, a's is kept.
+        c.rekey(&[("ent_a:1:640".into(), "sha256-ab:640".into())])
+            .unwrap();
+        c.rekey(&[("ent_b:2:640".into(), "sha256-ab:640".into())])
+            .unwrap();
+        assert!(c.contains("sha256-ab:640").unwrap());
+        assert!(!c.contains("ent_a:1:640").unwrap() && !c.contains("ent_b:2:640").unwrap());
+        assert_eq!(c.total_bytes(), 100);
+        c.put("ent_c:3:320", &[2u8; 50]).unwrap();
+        assert_eq!(c.retain(|k| k.starts_with("sha256-")).unwrap(), 1);
+        assert_eq!(c.total_bytes(), 100);
+        assert!(c.get("ent_c:3:320").unwrap().is_none());
     }
 }

@@ -1164,3 +1164,147 @@ async fn background_and_request_render_once() {
     );
     assert_eq!(previews.renders(), 2);
 }
+
+fn row_at(t: &T, path: &str) -> Option<wirephoto::db::EntryRow> {
+    let lib = t.app.libraries[0].api_id.clone();
+    let p = path.to_string();
+    t.app
+        .db
+        .read(|c| Ok(wirephoto::db::entry_by_path(c, &lib, &p)?))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn copies_share_one_set_of_previews() {
+    let t = setup().await;
+    std::fs::copy(t.lib.join("2026/Lisbon/a.jpg"), t.lib.join("2026/copy.jpg")).unwrap();
+    rescan(&t).await;
+    let (a, copy) = (
+        row_at(&t, "2026/Lisbon/a.jpg").unwrap(),
+        row_at(&t, "2026/copy.jpg").unwrap(),
+    );
+    assert_ne!(a.id, copy.id);
+    assert_eq!(a.sha256, copy.sha256);
+    let disk = t.app.previews.disk();
+    let shared = wirephoto::preview::key(&a, 640);
+    assert!(shared.starts_with("sha256-"));
+    assert_eq!(shared, wirephoto::preview::key(&copy, 640));
+    assert!(disk.contains(&shared).unwrap());
+    for r in [&a, &copy] {
+        let old = format!("{}:{}:640", r.id, r.etag());
+        assert!(
+            !disk.contains(&old).unwrap(),
+            "{old} moved to the content key"
+        );
+    }
+    // Served from the shared one.
+    let renders = t.app.previews.renders();
+    let lib = t.app.libraries[0].clone();
+    let src = wirephoto::preview::Source::File(lib.fs.clone(), copy.path.clone());
+    let (_, timing) = t.app.previews.get(&copy, src, 640).await.unwrap();
+    assert!(timing.hit);
+    assert_eq!(t.app.previews.renders(), renders);
+}
+
+#[tokio::test]
+async fn a_moved_folder_is_listed_with_everything_below_it() {
+    let t = setup().await;
+    let a = row_at(&t, "2026/Lisbon/a.jpg").unwrap();
+    std::fs::rename(t.lib.join("2026"), t.lib.join("2027")).unwrap();
+    // Arrived while the folder was moving: under a subfolder the index knows, not yet listed there.
+    std::fs::write(t.lib.join("2027/Lisbon/c.jpg"), jpeg(800, 600)).unwrap();
+    let (app, lib) = (t.app.clone(), t.app.libraries[0].clone());
+    tokio::task::spawn_blocking(move || {
+        wirephoto::indexer::sync_paths(&app, &lib, ["".to_string()].into_iter().collect())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        row_at(&t, "2027/Lisbon/a.jpg").unwrap().id,
+        a.id,
+        "kept its ID"
+    );
+    assert!(
+        row_at(&t, "2027/Lisbon/c.jpg").is_some(),
+        "found below the moved folder"
+    );
+    assert!(row_at(&t, "2026/Lisbon/a.jpg").is_none());
+}
+
+#[tokio::test]
+async fn previews_of_deleted_files_are_swept() {
+    let t = setup().await;
+    let (a, b) = (
+        row_at(&t, "2026/Lisbon/a.jpg").unwrap(),
+        row_at(&t, "2026/Lisbon/b.jpg").unwrap(),
+    );
+    let disk = t.app.previews.disk().clone();
+    let (ka, kb) = (
+        wirephoto::preview::key(&a, 640),
+        wirephoto::preview::key(&b, 640),
+    );
+    assert!(disk.contains(&ka).unwrap() && disk.contains(&kb).unwrap());
+    // Written under the entry key by an older server, for a file hashed since: moved, not dropped.
+    let old_key = format!("{}:{}:1280", a.id, a.etag());
+    disk.put(&old_key, b"older-preview").unwrap();
+    std::fs::remove_file(t.lib.join("2026/Lisbon/b.jpg")).unwrap();
+    rescan(&t).await;
+    let app = t.app.clone();
+    let n = tokio::task::spawn_blocking(move || wirephoto::indexer::sweep_previews(&app))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n >= 1);
+    assert!(!disk.contains(&kb).unwrap(), "b's previews went with it");
+    assert!(disk.contains(&ka).unwrap(), "a's stayed");
+    assert!(!disk.contains(&old_key).unwrap());
+    assert_eq!(
+        disk.get(&wirephoto::preview::key(&a, 1280))
+            .unwrap()
+            .as_deref(),
+        Some(&b"older-preview"[..]),
+        "moved to the content key"
+    );
+}
+
+#[tokio::test]
+async fn changes_between_registering_the_watcher_and_applying_it_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("photos");
+    std::fs::create_dir_all(lib.join("in")).unwrap();
+    std::fs::write(lib.join("in/a.jpg"), jpeg(400, 300)).unwrap();
+    let config: wirephoto::config::Config = toml::from_str(&format!(
+        "data = {:?}\n[[library]]\nid = 'nas'\nname = 'NAS'\npath = {:?}\nwatch = 'auto'\n[decode]\nprogram = {:?}\n[cache]\npregenerate = false\n",
+        dir.path().join("data"),
+        lib,
+        env!("CARGO_BIN_EXE_wirephoto")
+    ))
+    .unwrap();
+    let (app, _router) = wirephoto::build(config).unwrap();
+    let l = app.libraries[0].clone();
+    let watching = wirephoto::indexer::begin_watch(&l);
+    let (a, l2) = (app.clone(), l.clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l2))
+        .await
+        .unwrap()
+        .unwrap();
+    // After the scan listed the folder, before changes are applied: this used to be lost until a restart.
+    std::fs::write(lib.join("in/late.jpg"), jpeg(400, 300)).unwrap();
+    wirephoto::indexer::watch(app.clone(), l.clone(), watching);
+    let found = async {
+        loop {
+            let hit = app
+                .db
+                .read(|c| Ok(wirephoto::db::entry_by_path(c, &l.api_id, "in/late.jpg")?))
+                .unwrap();
+            if hit.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), found)
+        .await
+        .expect("the change made before watching was applied");
+}

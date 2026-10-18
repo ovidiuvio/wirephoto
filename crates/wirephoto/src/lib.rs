@@ -108,6 +108,8 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
 pub fn start(app: &Arc<App>) {
     for lib in &app.libraries {
         let (a, l) = (app.clone(), lib.clone());
+        // Watching starts before the scan so nothing changed during it is missed (indexer::begin_watch).
+        let watching = indexer::begin_watch(lib);
         tokio::spawn(async move {
             let (a2, l2) = (a.clone(), l.clone());
             match tokio::task::spawn_blocking(move || indexer::scan(&a2, &l2)).await {
@@ -116,7 +118,7 @@ pub fn start(app: &Arc<App>) {
                 Err(e) => tracing::error!(library = %l.api_id, "scan panicked: {e}"),
             }
             a.work.notify_one();
-            indexer::watch(a, l);
+            indexer::watch(a, l, watching);
         });
     }
     tokio::spawn(indexer::background(app.clone()));

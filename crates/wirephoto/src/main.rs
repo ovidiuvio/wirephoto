@@ -57,7 +57,8 @@ enum CacheCommand {
         filter: CacheFilter,
     },
     /// Writes the cached previews as JPEG files under DIR, mirroring the libraries' folders
-    /// (`<library>/<path>.<size>.jpg`; stale ones add their etag, orphans go to `_orphans/`).
+    /// (`<library>/<path>.<size>.jpg`, under the first path for copies sharing one; stale ones end
+    /// `.stale.jpg`, orphans go to `_orphans/`).
     Extract {
         dir: PathBuf,
         #[command(flatten)]
@@ -243,12 +244,14 @@ fn keys(config: Config, command: KeysCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A cached preview and what the index says about its file now.
+/// A cached preview and what the index says about it now.
 struct CacheItem {
     c: wirephoto::preview::inspect::Cached,
-    /// (library, path) of the file, if it is still indexed.
+    /// (library, path) of a file it is for, if any is still indexed.
     file: Option<(String, String)>,
-    /// The file changed since this preview was made (an old etag).
+    /// Entries it serves (several for copies sharing a content-keyed preview).
+    entries: Vec<String>,
+    /// An entry-keyed preview the file no longer uses: it changed since, or its previews are content-keyed now.
     stale: bool,
 }
 
@@ -263,6 +266,7 @@ impl CacheItem {
 }
 
 fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
+    use wirephoto::preview::KeyOf;
     use wirephoto::preview::inspect::CacheReader;
     let reader = CacheReader::open(&config.data.join("previews.redb"))?;
     if reader.snapshot() {
@@ -277,23 +281,57 @@ fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
     };
     let mut items = Vec::new();
     for c in reader.list()? {
-        if let Some(f) = filter
-            && (f.entry.as_ref().is_some_and(|e| *e != c.entry)
-                || f.size.is_some_and(|s| s != c.size))
+        if filter.is_some_and(|f| f.size.is_some_and(|s| s != c.size)) {
+            continue;
+        }
+        let (rows, stale) = match &c.of {
+            KeyOf::Entry(id, etag, _) => {
+                let row = db.read(|conn| Ok(wirephoto::db::entry_by_id(conn, id)?))?;
+                let stale = row
+                    .as_ref()
+                    .is_some_and(|r| r.etag() != *etag || r.sha256.is_some());
+                (row.into_iter().collect::<Vec<_>>(), stale)
+            }
+            KeyOf::Content(hash, _) => {
+                let rows = db.read(|conn| {
+                    let mut st = conn.prepare(&format!(
+                        "SELECT {} FROM {} WHERE e.sha256 = ? ORDER BY e.path",
+                        wirephoto::db::ENTRY_COLS,
+                        wirephoto::db::ENTRY_FROM
+                    ))?;
+                    let rows = st
+                        .query_map([&hash[..]], wirephoto::db::EntryRow::from_row)?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })?;
+                (rows, false)
+            }
+        };
+        let entries: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        if let Some(e) = filter.and_then(|f| f.entry.as_ref())
+            && !entries.contains(e)
         {
             continue;
         }
-        let row = db.read(|conn| Ok(wirephoto::db::entry_by_id(conn, &c.entry)?))?;
-        let stale = row.as_ref().is_some_and(|r| r.etag() != c.etag);
-        let file = row.map(|r| (r.library, r.path));
+        let mut files: Vec<(String, String)> =
+            rows.into_iter().map(|r| (r.library, r.path)).collect();
         if let Some(prefix) = filter.and_then(|f| f.path.as_deref()) {
-            let prefix = prefix.trim_end_matches('/');
-            match &file {
-                Some((_, p)) if p == prefix || p.starts_with(&format!("{prefix}/")) => {}
-                _ => continue,
+            // Stored paths have no leading slash.
+            let prefix = prefix.trim_matches('/');
+            files.retain(|(_, p)| {
+                prefix.is_empty() || p == prefix || p.starts_with(&format!("{prefix}/"))
+            });
+            if files.is_empty() {
+                continue;
             }
         }
-        items.push(CacheItem { c, file, stale });
+        let file = files.into_iter().next();
+        items.push(CacheItem {
+            c,
+            file,
+            entries,
+            stale,
+        });
     }
     items.sort_by(|a, b| (&a.file, a.c.size).cmp(&(&b.file, b.c.size)));
 
@@ -320,8 +358,9 @@ fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
             println!("{:>6}  {:>8}  {:>10}", "all", items.len(), human(total));
             let stale = items.iter().filter(|i| i.state() == "stale").count();
             let orphans = items.iter().filter(|i| i.state() == "orphan").count();
+            let shared = items.iter().filter(|i| i.entries.len() > 1).count();
             println!(
-                "\nstale (file changed since): {stale}   orphans (file no longer indexed): {orphans}"
+                "\nshared by copies: {shared}   stale (superseded): {stale}   orphans (no file): {orphans}"
             );
             println!("budget: {} (cache.max_size)", human(config.cache.max_size));
         }
@@ -331,8 +370,11 @@ fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default();
                 let what = match &i.file {
+                    Some((lib, path)) if i.entries.len() > 1 => {
+                        format!("{lib}:{path} (shared by {} copies)", i.entries.len())
+                    }
                     Some((lib, path)) => format!("{lib}:{path}"),
-                    None => i.c.entry.clone(),
+                    None => i.c.key.clone(),
                 };
                 println!(
                     "{:>5}  {:>8}  {used}  {:<7}  {what}",
@@ -346,13 +388,13 @@ fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
         CacheCommand::Extract { dir, .. } => {
             let mut written = 0usize;
             for i in &items {
-                let Some(jpeg) = reader.get(&i.c.key())? else {
+                let Some(jpeg) = reader.get(&i.c.key)? else {
                     continue;
                 };
                 let rel = match &i.file {
                     Some((lib, path)) if !i.stale => format!("{lib}/{path}.{}.jpg", i.c.size),
-                    Some((lib, path)) => format!("{lib}/{path}.{}.{}.jpg", i.c.size, i.c.etag),
-                    None => format!("_orphans/{}.{}.{}.jpg", i.c.entry, i.c.etag, i.c.size),
+                    Some((lib, path)) => format!("{lib}/{path}.{}.stale.jpg", i.c.size),
+                    None => format!("_orphans/{}.jpg", i.c.key.replace(':', ".")),
                 };
                 // Paths come from the index: keep them below DIR whatever they contain.
                 let rel: PathBuf = std::path::Path::new(&rel)

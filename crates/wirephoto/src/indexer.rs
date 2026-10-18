@@ -26,6 +26,8 @@ use crate::{kind, media, preview};
 
 /// A folder still to list: its row and path.
 type Pending = (i64, String);
+/// A folder to list, and whether to list the folders below it too.
+type Queued = (Pending, bool);
 
 /// The root folder's row, created on first start.
 fn ensure_root(app: &App, lib: &Library) -> anyhow::Result<i64> {
@@ -66,7 +68,7 @@ fn sync_dir(
     lib: &Library,
     dir: &Pending,
     recursive: bool,
-) -> anyhow::Result<Vec<Pending>> {
+) -> anyhow::Result<Vec<Queued>> {
     let (dir_rowid, dir_rel) = dir;
     let listing = match lib.fs.list(dir_rel) {
         Ok(l) => l,
@@ -94,7 +96,7 @@ fn sync_dir(
                         // The folder's own modification time is updated when it is listed (polling compares it).
                         t.execute("UPDATE entries SET missing = 0 WHERE rowid = ? AND missing != 0", [row.rowid])?;
                         if recursive {
-                            next.push((row.rowid, rel));
+                            next.push(((row.rowid, rel), true));
                         }
                     } else {
                         if (row.size, row.mtime_ns, row.ino) != (st.size, st.mtime_ns, st.ino) {
@@ -135,8 +137,10 @@ fn sync_dir(
                 }
                 let parent_id = t.query_row("SELECT id FROM entries WHERE rowid = ?", [dir_rowid], |r| r.get::<_, String>(0))?;
                 db::record_change(t, ChangeType::Updated, &row.id, &row.library, Some(&parent_id))?;
+                // A moved folder is listed again with everything below it: folders under it that a scan in
+                // progress had queued under their old paths would otherwise never be listed.
                 if st.is_dir {
-                    next.push((row.rowid, rel));
+                    next.push(((row.rowid, rel), true));
                 }
             } else {
                 let (k, mime) = if st.is_dir { (Kind::Folder, None) } else { kind::guess(name) };
@@ -155,7 +159,7 @@ fn sync_dir(
                 let parent_id = t.query_row("SELECT id FROM entries WHERE rowid = ?", [dir_rowid], |r| r.get::<_, String>(0))?;
                 db::record_change(t, ChangeType::Created, &id, &lib.api_id, Some(&parent_id))?;
                 if st.is_dir {
-                    next.push((rowid, rel));
+                    next.push(((rowid, rel), true));
                 }
             }
             lib.status.bump();
@@ -208,13 +212,15 @@ fn finalize(app: &App, lib: &Library) -> anyhow::Result<()> {
 
 /// Lists folders breadth-first from `start`.
 fn walk(app: &App, lib: &Library, start: Vec<Pending>, recursive: bool) -> anyhow::Result<()> {
-    let mut queue: VecDeque<Pending> = start.into();
+    let mut queue: VecDeque<Queued> = start.into_iter().map(|p| (p, recursive)).collect();
+    // By row and path: a folder renamed during the walk is queued again under its new path, and listing its old
+    // one (not found) must not stop that.
     let mut seen = HashSet::new();
-    while let Some(dir) = queue.pop_front() {
-        if !seen.insert(dir.0) {
+    while let Some((dir, deep)) = queue.pop_front() {
+        if !seen.insert(dir.clone()) {
             continue;
         }
-        match sync_dir(app, lib, &dir, recursive) {
+        match sync_dir(app, lib, &dir, deep) {
             Ok(next) => queue.extend(next),
             Err(e) => tracing::warn!(library = %lib.api_id, path = %dir.1, "listing failed: {e:#}"),
         }
@@ -252,7 +258,7 @@ pub fn scan(app: &App, lib: &Library) -> anyhow::Result<()> {
 
 /// Re-lists the folders that changed: by path (from filesystem events) or, when polling, every folder whose
 /// modification time differs from the index.
-fn sync_paths(app: &App, lib: &Library, dirs: HashSet<String>) -> anyhow::Result<()> {
+pub fn sync_paths(app: &App, lib: &Library, dirs: HashSet<String>) -> anyhow::Result<()> {
     let mut start = Vec::new();
     for rel in dirs {
         // The nearest folder the index knows: a new folder is found by listing its parent.
@@ -295,23 +301,46 @@ fn poll(app: &App, lib: &Library) -> anyhow::Result<()> {
     walk(app, lib, changed, false)
 }
 
-/// Starts watching a library: filesystem events when available, polling otherwise.
-pub fn watch(app: Arc<App>, lib: Arc<Library>) {
+/// A library's filesystem watcher, registered but not yet applied: events queue until [`watch`] runs.
+pub struct Watching {
+    watcher: Option<notify::RecommendedWatcher>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    root: std::path::PathBuf,
+}
+
+/// Registers the watcher BEFORE the library's scan, so nothing that changes during the scan is missed: its
+/// events wait in the queue and are applied once the scan is done ([`watch`]). Applying them during the scan
+/// instead would run a pass's end (deleting what is missing) while the scan has not yet seen where a moved
+/// entry went.
+pub fn begin_watch(lib: &Library) -> Watching {
     use notify::Watcher;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
     let root = std::fs::canonicalize(&lib.fs.root).unwrap_or_else(|_| lib.fs.root.clone());
-    let watcher = if lib.cfg.watch == crate::config::WatchMode::Poll {
-        None
-    } else {
-        notify::recommended_watcher(move |ev| {
+    let watch_root = root.clone();
+    let watcher =
+        if lib.cfg.watch == crate::config::WatchMode::Poll {
+            None
+        } else {
+            notify::recommended_watcher(move |ev| {
             let _ = tx.send(ev);
         })
-        .and_then(|mut w| w.watch(&root, notify::RecursiveMode::Recursive).map(|_| w))
+        .and_then(|mut w| w.watch(&watch_root, notify::RecursiveMode::Recursive).map(|_| w))
         .map_err(
             |e| tracing::warn!(library = %lib.api_id, "watching unavailable, polling instead: {e}"),
         )
         .ok()
-    };
+        };
+    Watching { watcher, rx, root }
+}
+
+/// Applies a library's changes from then on: the queued and new filesystem events when watching, polling
+/// otherwise.
+pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
+    let Watching {
+        watcher,
+        mut rx,
+        root,
+    } = watching;
     lib.live.store(watcher.is_some(), Ordering::Relaxed);
     if let Some(watcher) = watcher {
         let (app, lib) = (app.clone(), lib.clone());
@@ -564,8 +593,8 @@ pub fn hash_entry(app: &App, row: &EntryRow) -> anyhow::Result<Option<[u8; 32]>>
     if after.is_none_or(|s| (s.size, s.mtime_ns, s.ino) != (row.size, row.mtime_ns, row.ino)) {
         return Ok(None); // changed while hashing; the next pass will try again
     }
-    app.write(|t| {
-        t.execute(
+    let stored = app.write(|t| {
+        let n = t.execute(
             "UPDATE entries SET sha256 = ? WHERE rowid = ? AND mtime_ns = ? AND size = ?",
             params![&sum[..], row.rowid, row.mtime_ns, row.size as i64],
         )?;
@@ -576,8 +605,14 @@ pub fn hash_entry(app: &App, row: &EntryRow) -> anyhow::Result<Option<[u8; 32]>>
             &row.library,
             row.parent_id.as_deref(),
         )?;
-        Ok(())
+        Ok(n > 0)
     })?;
+    if stored {
+        // Its previews are now keyed by content: moved there, or dropped if a copy's are there already.
+        if let Err(e) = app.previews.adopt_hash(row, &sum) {
+            tracing::debug!(entry = %row.id, "moving previews to the content key: {e:#}");
+        }
+    }
     Ok(Some(sum))
 }
 
@@ -707,6 +742,17 @@ pub async fn upkeep(app: Arc<App>) {
         .await;
         if tick % 120 == 1 {
             let a = app.clone();
+            let _ = tokio::task::spawn_blocking(move || match sweep_previews(&a) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(previews = n, "removed previews of files gone or changed")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("sweeping previews: {e:#}"),
+            })
+            .await;
+        }
+        if tick % 120 == 1 {
+            let a = app.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::write::purge_trash(&a) {
                     tracing::warn!("emptying trash: {e:#}");
@@ -725,6 +771,42 @@ pub async fn upkeep(app: Arc<App>) {
             .await;
         }
     }
+}
+
+/// Tidies the preview cache: removes previews no file needs any more (of entries deleted, of old versions of
+/// changed files) and moves entry-keyed ones whose file has since been hashed to its content key (a cache
+/// written before previews were content-keyed, or a rendering that finished after its file was hashed). Trashed
+/// entries keep theirs, for a restore. Returns how many were removed.
+pub fn sweep_previews(app: &App) -> anyhow::Result<u64> {
+    let mut moves = Vec::new();
+    let removed = app.previews.disk().retain(|key| {
+        let live = app.db.read(|c| {
+            Ok(match preview::parse_key(key) {
+                Some(preview::KeyOf::Content(hash, _)) => c
+                    .query_row(
+                        "SELECT 1 FROM entries WHERE sha256 = ? LIMIT 1",
+                        [&hash[..]],
+                        |_| Ok(()),
+                    )
+                    .is_ok(),
+                Some(preview::KeyOf::Entry(id, etag, size)) => match db::entry_by_id(c, &id)? {
+                    Some(r) if r.etag() == etag => {
+                        if r.sha256.is_some() {
+                            moves.push((key.to_string(), preview::key(&r, size)));
+                        }
+                        true
+                    }
+                    _ => false,
+                },
+                None => false,
+            })
+        });
+        live.unwrap_or(true) // keep on a database error
+    })?;
+    if !moves.is_empty() {
+        app.previews.disk().rekey(&moves)?;
+    }
+    Ok(removed)
 }
 
 /// Runs the background passes until there is nothing left to do (tests, and tools that want a settled index).
