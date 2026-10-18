@@ -237,7 +237,8 @@ so.
   fail by construction.
 - **Decoders**: image and video decoders are the largest attack surface (any written file reaches them), so pixel
   work runs in worker processes with seccomp, no network and a read-only file descriptor. A crash costs one
-  preview.
+  preview; workers that keep dying are respawned with a back-off. On a kernel without seccomp filters the
+  workers run unfiltered (still separate and unprivileged) unless `WIREPHOTO_SECCOMP=required`.
 - **Container**: non-root (`PUID`/`PGID`), read-only root filesystem, no capabilities, distroless base. A
   read-only library can be mounted `:ro`.
 - **Writes**: conditional, integrity-checkable, logged with the key that made them; deletes go through the

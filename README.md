@@ -67,8 +67,10 @@ from the design:
 
 - PSD/PSB, JPEG XL, HDR tone-mapping, LibRaw for RAWs without an embedded preview
 - the decode workers' seccomp filter is a deny list (network, file creation and changes, io_uring, kernel and
-  process interfaces) and has not run on Linux yet (CI is its first test); running as root, workers drop to `nobody`, otherwise they share
-  the server's user and could still signal it
+  process interfaces), installed with `seccomp()` or, on older kernels (many NAS systems), `prctl`; a kernel with
+  no seccomp filters at all gets none (the worker says so on stderr; `WIREPHOTO_SECCOMP=required` refuses
+  instead). Running as root, workers drop to `nobody`; otherwise they share the server's user and could still
+  signal it
 - zstd/brotli for downloads of uncompressed RAW and TIFF; multi-range requests
 - neighbour readahead when an original is opened; newest-first preview scheduling
 - a generated OpenAPI document

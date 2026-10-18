@@ -45,6 +45,8 @@ pub struct Pool {
     freed: Condvar,
     spawned: AtomicU64,
     lost: AtomicU64,
+    /// Workers lost since the last good reply.
+    in_a_row: AtomicU64,
 }
 
 /// How long a worker may take over one image, and over one video.
@@ -65,6 +67,7 @@ impl Pool {
             freed: Condvar::new(),
             spawned: AtomicU64::new(0),
             lost: AtomicU64::new(0),
+            in_a_row: AtomicU64::new(0),
         }
     }
 
@@ -104,6 +107,7 @@ impl Pool {
         match exchange(&mut w, &req, &input, timeout) {
             Ok(reply) => {
                 self.checkin(w);
+                self.in_a_row.store(0, Ordering::Relaxed);
                 reply
             }
             Err(e) => {
@@ -115,7 +119,16 @@ impl Pool {
                 };
                 drop(w);
                 self.release();
-                tracing::warn!(?status, "decode worker lost: {e:#}");
+                // Workers that keep dying (one that cannot start, a broken environment) must not be respawned
+                // in a tight loop: after three in a row, back off, up to 30 s, and log only now and then.
+                let n = self.in_a_row.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 || n.is_multiple_of(50) {
+                    tracing::warn!(?status, in_a_row = n, "decode worker lost: {e:#}");
+                }
+                if n >= 3 {
+                    let wait = Duration::from_millis(100u64 << (n - 3).min(9)).min(Duration::from_secs(30));
+                    std::thread::sleep(wait);
+                }
                 Err(e.context("decode worker lost"))
             }
         }

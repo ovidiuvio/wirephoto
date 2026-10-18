@@ -155,7 +155,48 @@ pub fn enter() -> anyhow::Result<()> {
         arch,
     )?;
     let program: BpfProgram = filter.try_into()?;
-    seccompiler::apply_filter_all_threads(&program)?;
+    // The worker has one thread here, so the filter needs no thread sync. The `seccomp` system call (Linux
+    // 3.17) is tried first; older kernels, like those of many NAS systems, have the same filter through
+    // `prctl`. A kernel built without seccomp filters at all gets none: the worker is still its own process,
+    // without privileges and unable to gain any, and says so on stderr.
+    match seccompiler::apply_filter(&program) {
+        Ok(()) => Ok(()),
+        Err(seccompiler::Error::Seccomp(e)) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            let prog = libc::sock_fprog {
+                len: program.len() as u16,
+                // seccompiler's `sock_filter` is the kernel's layout, as libc's is.
+                filter: program.as_ptr() as *mut libc::sock_filter,
+            };
+            // SAFETY: `prog` points into `program`, which outlives the call; the kernel copies the filter.
+            let rc = unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                    &prog as *const libc::sock_fprog,
+                    0,
+                    0,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            unfiltered(std::io::Error::last_os_error())
+        }
+        Err(seccompiler::Error::Seccomp(e)) if e.raw_os_error() == Some(libc::EINVAL) => unfiltered(e),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// No seccomp filter on this kernel: carry on without it, unless `WIREPHOTO_SECCOMP=required`.
+#[cfg(target_os = "linux")]
+fn unfiltered(why: std::io::Error) -> anyhow::Result<()> {
+    if std::env::var("WIREPHOTO_SECCOMP").as_deref() == Ok("required") {
+        anyhow::bail!("this kernel has no seccomp filters ({why}) and WIREPHOTO_SECCOMP=required");
+    }
+    eprintln!(
+        "decode worker: this kernel has no seccomp filters ({why}); running without the system-call filter \
+         (still a separate process without privileges). Set WIREPHOTO_SECCOMP=required to refuse instead."
+    );
     Ok(())
 }
 
