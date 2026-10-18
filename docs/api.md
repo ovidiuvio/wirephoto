@@ -212,6 +212,10 @@ metadata.
   | Video | The poster frame |
 
   Previews are for seeing a file quickly; colour-critical and HDR work uses the original.
+- **Only if cached**: `Cache-Control: only-if-cached`, or `?cached=only` where a header cannot be sent (an
+  `<img>`), answers from the cache or not at all: `504 not-cached` instead of decoding the original. For a
+  placeholder while the original downloads anyway. Sizes below 640 count as cached when the 640 is (they are
+  made from it in about a millisecond).
 - With `v` equal to the file's current `etag`, it is cached for good
   (`Cache-Control: private, max-age=31536000, immutable`). With an old `v`, the response is `307` to the
   current URL.
@@ -411,6 +415,7 @@ Apps act on `code`; `title` and `detail` are for people.
 | `version-mismatch` | 412 | `If-Match` failed (`PATCH`, `DELETE`) |
 | `too-large` | 413 | Over a limit (batch, previews) |
 | `unsupported-media` | 415 | Cannot preview this file |
+| `not-cached` | 504 | `only-if-cached` and the preview is not made yet |
 | `preview-failed` | 503 | The preview could not be made this time (a decoder crashed, the file could not be opened); try again |
 | `internal` | 500 | A bug |
 | `storage-unavailable` | 503 | The library's folder cannot be read (an unmounted share) |

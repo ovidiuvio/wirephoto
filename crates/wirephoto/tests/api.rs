@@ -1627,3 +1627,44 @@ async fn background_work_steps_aside_while_the_api_is_busy() {
     wirephoto::indexer::settle(&t.app).await.unwrap();
     assert!(row_at(&t, "2026/new.jpg").unwrap().sha256.is_some());
 }
+
+#[tokio::test]
+async fn only_if_cached_never_renders_from_the_original() {
+    let t = setup().await;
+    let a = t.entry_at("/2026/Lisbon/a.jpg").await;
+    let tpl = a["urls"]["preview"].as_str().unwrap().to_string();
+    let at = |size: u32, cached: bool| {
+        let mut u = tpl.replace("{size}", &size.to_string());
+        if cached {
+            u.push_str("&cached=only");
+        }
+        Request::get(u).body(Body::empty()).unwrap()
+    };
+    let renders = t.app.previews.renders();
+    let r = t.send(at(2560, true)).await;
+    assert_eq!(r.status, 504, "not made yet, and not made now");
+    assert_eq!(r.json()["code"], "not-cached");
+    assert_eq!(t.app.previews.renders(), renders, "nothing rendered");
+    // The pre-generated 640, and a smaller one made from it, count as cached.
+    assert_eq!(t.send(at(640, true)).await.status, 200);
+    assert_eq!(t.send(at(320, true)).await.status, 200);
+    // The header form.
+    let r = t
+        .send(
+            Request::get(tpl.replace("{size}", "1280"))
+                .header(header::CACHE_CONTROL, "only-if-cached")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 504);
+    // Once made, it is served.
+    assert_eq!(t.send(at(2560, false)).await.status, 200);
+    let r = t.send(at(2560, true)).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        decode_size(&r.body).0,
+        1600,
+        "never larger than the original"
+    );
+}

@@ -105,6 +105,14 @@ impl ApiError {
         )
         .detail(d)
     }
+    /// Asked for only what is cached (`only-if-cached`), and it is not.
+    pub fn not_cached() -> ApiError {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "not-cached",
+            "That preview is not made yet, and only a cached one was asked for",
+        )
+    }
     pub fn storage_unavailable(d: impl Into<String>) -> ApiError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

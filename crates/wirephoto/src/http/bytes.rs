@@ -120,6 +120,8 @@ pub async fn get_content(
 pub struct PreviewQuery {
     v: Option<String>,
     sig: Option<String>,
+    /// `only`: answer from the cache or not at all (`504`), never by rendering from the original.
+    cached: Option<String>,
 }
 
 fn parse_size(file: &str) -> ApiResult<u32> {
@@ -138,7 +140,18 @@ pub async fn get_preview(
     ByteCaller(key): ByteCaller,
     Path((id, file)): Path<(String, String)>,
     Query(q): Query<PreviewQuery>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
+    // HTTP's `Cache-Control: only-if-cached`, or `?cached=only` where a header cannot be sent (an <img>).
+    let only_cached = q.cached.as_deref() == Some("only")
+        || headers
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| {
+                v.split(',')
+                    .any(|d| d.trim().eq_ignore_ascii_case("only-if-cached"))
+            });
     let size = parse_size(&file)?;
     let row = load_file(&app, key, id).await?;
     if !row.previewable {
@@ -152,17 +165,34 @@ pub async fn get_preview(
         if let Some(sig) = &q.sig {
             loc.push_str(&format!("&sig={sig}"));
         }
+        if only_cached {
+            loc.push_str("&cached=only");
+        }
         return Ok((StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, loc)]).into_response());
     }
     let lib = app
         .library(&row.library)
         .ok_or_else(ApiError::not_found)?
         .clone();
-    let (bytes, timing) = app
-        .previews
-        .get(&row, Source::File(lib.fs.clone(), row.path.clone()), size)
-        .await
-        .map_err(|e| preview_error(&row, &e))?;
+    let (bytes, timing) = if only_cached {
+        let b = app
+            .previews
+            .get_cached(&row, size)
+            .await
+            .ok_or_else(ApiError::not_cached)?;
+        (
+            b,
+            crate::preview::Timing {
+                hit: true,
+                render_ms: 0.0,
+            },
+        )
+    } else {
+        app.previews
+            .get(&row, Source::File(lib.fs.clone(), row.path.clone()), size)
+            .await
+            .map_err(|e| preview_error(&row, &e))?
+    };
     let cache = if q.v.is_some() {
         "private, max-age=31536000, immutable"
     } else {

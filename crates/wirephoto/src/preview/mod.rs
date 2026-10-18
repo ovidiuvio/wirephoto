@@ -293,6 +293,27 @@ impl Previews {
         Ok(self.renders() > before && res.is_fresh())
     }
 
+    /// A preview only if it can be had without decoding the original: cached, or made from the cached 640
+    /// (about a millisecond).
+    pub async fn get_cached(&self, entry: &EntryRow, size: u32) -> Option<Bytes> {
+        if size >= CACHED_SIZE {
+            return self.cached(&key(entry, size)).await;
+        }
+        let k = key(entry, size);
+        if let Some(b) = self.mem.get(&k).await {
+            self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
+            return Some(b);
+        }
+        let base = self.cached(&key(entry, CACHED_SIZE)).await?;
+        let out = tokio::task::spawn_blocking(move || shrink(&base, size))
+            .await
+            .ok()?
+            .ok()?;
+        let b = Bytes::from(out);
+        self.mem.insert(k, b.clone()).await;
+        Some(b)
+    }
+
     /// A file was just hashed: its entry-keyed previews move to the content key, or are dropped where a copy's
     /// are there already (blocking).
     pub fn adopt_hash(&self, before: &EntryRow, hash: &[u8; 32]) -> anyhow::Result<()> {
