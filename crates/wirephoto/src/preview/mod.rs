@@ -2,10 +2,12 @@
 //! ([`crate::decode`]). Identical requests coalesce into one rendering; a rendering nobody waits for any more is
 //! dropped with its request before it reaches a worker (one already in a worker finishes and is cached).
 //!
-//! Sizes below the cached 640 px are made from it, not from the original: shrinking our own 640 px JPEG takes a
-//! couple of milliseconds where decoding a 40 MP original takes tens to hundreds.
+//! Sizes below the cached 640 px are made from it, not from the original, and kept in memory only: shrinking our
+//! own 640 px JPEG takes 0.4-1.2 ms (measured, one M2 Max core) where decoding a 40 MP original takes tens to
+//! hundreds, and keeping a 320 on disk would add ~56% to the cache for that.
 
 pub mod cache;
+pub mod inspect;
 pub mod render;
 
 use std::sync::Arc;
@@ -111,7 +113,13 @@ impl Previews {
         size: u32,
     ) -> anyhow::Result<(Bytes, Timing)> {
         let k = key(entry, size);
-        if let Some(b) = self.cached(&k).await {
+        // Sizes made from the 640 live in memory only: the disk never has them.
+        let hit = if size < CACHED_SIZE {
+            self.mem.get(&k).await
+        } else {
+            self.cached(&k).await
+        };
+        if let Some(b) = hit {
             return Ok((
                 b,
                 Timing {
@@ -123,16 +131,9 @@ impl Previews {
         let started = Instant::now();
         let bytes = if size < CACHED_SIZE {
             let base = self.render_cached(entry, src, CACHED_SIZE).await?;
-            let disk = self.disk.clone();
-            let kk = k.clone();
             self.mem
                 .try_get_with(k, async move {
-                    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                        let jpeg = shrink(&base, size)?;
-                        disk.put(&kk, &jpeg)?;
-                        Ok(jpeg)
-                    })
-                    .await??;
+                    let out = tokio::task::spawn_blocking(move || shrink(&base, size)).await??;
                     anyhow::Ok(Bytes::from(out))
                 })
                 .await
@@ -150,7 +151,12 @@ impl Previews {
     }
 
     /// A preview from the caches, or rendered from the original in a worker (coalesced).
-    async fn render_cached(&self, entry: &EntryRow, src: Source, size: u32) -> anyhow::Result<Bytes> {
+    async fn render_cached(
+        &self,
+        entry: &EntryRow,
+        src: Source,
+        size: u32,
+    ) -> anyhow::Result<Bytes> {
         let k = key(entry, size);
         if let Some(b) = self.cached(&k).await {
             return Ok(b);
@@ -207,9 +213,15 @@ async fn render_and_store(
 }
 
 /// A smaller preview from a cached one (our own baseline sRGB JPEG, so it is decoded here, not in a worker):
-/// DCT scaling does most of it (640 -> 320 -> 160 exactly), Lanczos the rest.
+/// DCT scaling does most of it (640 -> 320 -> 160 exactly), Lanczos the rest. 480 keeps the usual quality: a
+/// 0.75 resample shows the 640's blocks more (SSIMULACRA2 57.8 at q80, 55.8 at q70).
 pub fn shrink(jpeg: &[u8], size: u32) -> anyhow::Result<Vec<u8>> {
-    render::finish(render::decode_jpeg(jpeg, size)?, size, render::Encoder::Turbo)
+    let encoder = if size <= 320 {
+        render::Encoder::Small
+    } else {
+        render::Encoder::Turbo
+    };
+    render::finish(render::decode_jpeg(jpeg, size)?, size, encoder)
 }
 
 /// How a worker decodes this entry.
@@ -250,14 +262,21 @@ mod tests {
 
     #[test]
     fn smaller_sizes_from_the_cached_one() {
-        let px: Vec<u8> = (0..640 * 427).flat_map(|i| [(i % 251) as u8, (i % 241) as u8, 90]).collect();
-        let base = render::encode(&render::Rgb { w: 640, h: 427, px }, render::Encoder::Turbo).unwrap();
+        let px: Vec<u8> = (0..640 * 427)
+            .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, 90])
+            .collect();
+        let base =
+            render::encode(&render::Rgb { w: 640, h: 427, px }, render::Encoder::Turbo).unwrap();
         for (size, want) in [(160, (160, 107)), (320, (320, 214)), (480, (480, 320))] {
             let out = shrink(&base, size).unwrap();
             let d = render::decode_jpeg(&out, 10_000).unwrap();
             // DCT scaling rounds up (427 * 6/8 = 321), a pixel off plain rounding.
             assert_eq!(d.img.w, want.0, "size {size}");
-            assert!(d.img.h.abs_diff(want.1) <= 1, "size {size}: height {}", d.img.h);
+            assert!(
+                d.img.h.abs_diff(want.1) <= 1,
+                "size {size}: height {}",
+                d.img.h
+            );
         }
     }
 }

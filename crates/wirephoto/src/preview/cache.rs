@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
-const PREVIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("previews");
+pub(super) const PREVIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("previews");
 /// key -> (bytes, last used, unix seconds)
-const META: TableDefinition<&str, (u64, u64)> = TableDefinition::new("meta");
+pub(super) const META: TableDefinition<&str, (u64, u64)> = TableDefinition::new("meta");
 
 /// Hits only refresh the last-used time when it is older than this, so reads stay reads.
 const TOUCH_AFTER: u64 = 24 * 3600;

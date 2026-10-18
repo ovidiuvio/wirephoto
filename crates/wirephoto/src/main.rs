@@ -40,6 +40,42 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+    /// Looks inside the preview cache, for debugging. Works while the server runs (reads a copy).
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Counts and bytes per preview size, and how many are stale or orphaned.
+    Stats,
+    /// One line per cached preview: size, bytes, last used, state, path.
+    List {
+        #[command(flatten)]
+        filter: CacheFilter,
+    },
+    /// Writes the cached previews as JPEG files under DIR, mirroring the libraries' folders
+    /// (`<library>/<path>.<size>.jpg`; stale ones add their etag, orphans go to `_orphans/`).
+    Extract {
+        dir: PathBuf,
+        #[command(flatten)]
+        filter: CacheFilter,
+    },
+}
+
+#[derive(clap::Args)]
+struct CacheFilter {
+    /// Only this entry (ent_…).
+    #[arg(long)]
+    entry: Option<String>,
+    /// Only this preview size (160, 320, 480, 640, 1280, 2560).
+    #[arg(long)]
+    size: Option<u32>,
+    /// Only previews whose file is under this path in its library (e.g. /2026/Lisbon).
+    #[arg(long)]
+    path: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -87,6 +123,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve => tokio::runtime::Runtime::new()?.block_on(serve(config)),
         Command::Keys { command } => keys(config, command),
         Command::Health => health(&config),
+        Command::Cache { command } => cache(config, command),
         Command::Decode => unreachable!(),
     }
 }
@@ -204,4 +241,142 @@ fn keys(config: Config, command: KeysCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A cached preview and what the index says about its file now.
+struct CacheItem {
+    c: wirephoto::preview::inspect::Cached,
+    /// (library, path) of the file, if it is still indexed.
+    file: Option<(String, String)>,
+    /// The file changed since this preview was made (an old etag).
+    stale: bool,
+}
+
+impl CacheItem {
+    fn state(&self) -> &'static str {
+        match (&self.file, self.stale) {
+            (None, _) => "orphan",
+            (Some(_), true) => "stale",
+            _ => "current",
+        }
+    }
+}
+
+fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
+    use wirephoto::preview::inspect::CacheReader;
+    let reader = CacheReader::open(&config.data.join("previews.redb"))?;
+    if reader.snapshot() {
+        eprintln!(
+            "(the server has the cache open: reading a copy, as of its last flush up to 30 s ago)"
+        );
+    }
+    let db = open_db(&config)?;
+    let filter = match &command {
+        CacheCommand::Stats => None,
+        CacheCommand::List { filter } | CacheCommand::Extract { filter, .. } => Some(filter),
+    };
+    let mut items = Vec::new();
+    for c in reader.list()? {
+        if let Some(f) = filter
+            && (f.entry.as_ref().is_some_and(|e| *e != c.entry)
+                || f.size.is_some_and(|s| s != c.size))
+        {
+            continue;
+        }
+        let row = db.read(|conn| Ok(wirephoto::db::entry_by_id(conn, &c.entry)?))?;
+        let stale = row.as_ref().is_some_and(|r| r.etag() != c.etag);
+        let file = row.map(|r| (r.library, r.path));
+        if let Some(prefix) = filter.and_then(|f| f.path.as_deref()) {
+            let prefix = prefix.trim_end_matches('/');
+            match &file {
+                Some((_, p)) if p == prefix || p.starts_with(&format!("{prefix}/")) => {}
+                _ => continue,
+            }
+        }
+        items.push(CacheItem { c, file, stale });
+    }
+    items.sort_by(|a, b| (&a.file, a.c.size).cmp(&(&b.file, b.c.size)));
+
+    match command {
+        CacheCommand::Stats => {
+            let mut sizes: std::collections::BTreeMap<u32, (u64, u64)> = Default::default();
+            for i in &items {
+                let s = sizes.entry(i.c.size).or_default();
+                s.0 += 1;
+                s.1 += i.c.bytes;
+            }
+            println!(
+                "{:>6}  {:>8}  {:>10}  {:>8}",
+                "size", "previews", "bytes", "average"
+            );
+            for (size, (n, bytes)) in &sizes {
+                println!(
+                    "{size:>6}  {n:>8}  {:>10}  {:>8}",
+                    human(*bytes),
+                    human(bytes / n.max(&1))
+                );
+            }
+            let total: u64 = items.iter().map(|i| i.c.bytes).sum();
+            println!("{:>6}  {:>8}  {:>10}", "all", items.len(), human(total));
+            let stale = items.iter().filter(|i| i.state() == "stale").count();
+            let orphans = items.iter().filter(|i| i.state() == "orphan").count();
+            println!(
+                "\nstale (file changed since): {stale}   orphans (file no longer indexed): {orphans}"
+            );
+            println!("budget: {} (cache.max_size)", human(config.cache.max_size));
+        }
+        CacheCommand::List { .. } => {
+            for i in &items {
+                let used = chrono::DateTime::from_timestamp(i.c.last_used as i64, 0)
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                let what = match &i.file {
+                    Some((lib, path)) => format!("{lib}:{path}"),
+                    None => i.c.entry.clone(),
+                };
+                println!(
+                    "{:>5}  {:>8}  {used}  {:<7}  {what}",
+                    i.c.size,
+                    human(i.c.bytes),
+                    i.state()
+                );
+            }
+            eprintln!("{} previews", items.len());
+        }
+        CacheCommand::Extract { dir, .. } => {
+            let mut written = 0usize;
+            for i in &items {
+                let Some(jpeg) = reader.get(&i.c.key())? else {
+                    continue;
+                };
+                let rel = match &i.file {
+                    Some((lib, path)) if !i.stale => format!("{lib}/{path}.{}.jpg", i.c.size),
+                    Some((lib, path)) => format!("{lib}/{path}.{}.{}.jpg", i.c.size, i.c.etag),
+                    None => format!("_orphans/{}.{}.{}.jpg", i.c.entry, i.c.etag, i.c.size),
+                };
+                // Paths come from the index: keep them below DIR whatever they contain.
+                let rel: PathBuf = std::path::Path::new(&rel)
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .collect();
+                let out = dir.join(rel);
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&out, jpeg).with_context(|| format!("writing {}", out.display()))?;
+                written += 1;
+            }
+            println!("wrote {written} previews to {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+fn human(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
 }

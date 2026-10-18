@@ -159,7 +159,7 @@ neutral grey, the first frame or page, HDR tone-mapped, everything converted to 
 | Size | Made | Encoder | Why |
 |---|---|---|---|
 | **640 px** | Ahead of time for every photo (and on demand until then), kept in the cache | **jpegli**, 4:2:0, baseline | The size filmstrips and galleries use: sharp in 3:2 cells up to ~210 CSS px tall at 2x. Stored for every photo, so size matters most |
-| 160, 320, 480 px | On demand **from the cached 640 px preview** (rendering it first if missing), cached, evicted first | **libjpeg-turbo** | ~1 ms instead of decoding the original again (40 MP: 20–470 ms) |
+| 160, 320, 480 px | On demand **from the cached 640 px preview** (rendering it first if missing), kept in memory only | **libjpeg-turbo**, quality 70 for 160/320, 80 for 480 | 0.4–1.2 ms instead of decoding the original again (40 MP: 20–470 ms); on disk a 320 would add ~56% to the cache for nothing |
 | 1280, 2560 px | On demand from the original, cached, evicted first | **libjpeg-turbo** | Viewed one at a time; latency matters most |
 
 Measured on lith's test corpus (16 camera and phone images, 640 px, `scripts/bench-jpeg.py`), at equal
@@ -178,6 +178,17 @@ library through its libjpeg-compatible C interface, alongside the other C librar
 The cache targets SSIMULACRA2 ≈ 70 ("high quality"): jpegli quality 68, where a 640 px preview averages ~31 KB
 (libjpeg-turbo quality 80, used before, scored ~78 at ~50 KB). `crates/jpegli-sys` vendors jpegli and Highway
 (`scripts/vendor-jpegli.sh` refreshes them) and builds them with cmake behind a one-call RGB-to-JPEG shim.
+
+The sizes made from the 640 cannot be better than it, so they spend fewer bytes: measured on 50 camera photos
+against references downscaled from the 2560 px preview (SSIMULACRA2; the cached 640 scores 72.1 at 21.9 KB):
+
+| From the 640 | q70 | q80 | Time |
+|---|---|---|---|
+| 320 px | 63.5, 9.5 KB | 65.6, 11.6 KB | 0.57 ms |
+| 160 px | 64.7, 3.5 KB | 66.0, 4.3 KB | 0.38 ms |
+| 480 px | 55.8, 17.4 KB | 57.8, 21.5 KB | 1.24 ms |
+
+480 keeps quality 80: a 0.75 resample shows the 640's blocks more, and lowering it costs more than it saves.
 
 **Crates**: `wirephoto` (the binary with the modules above) and `wirephoto-api` (request and response types, the
 OpenAPI document, shared with generated clients).

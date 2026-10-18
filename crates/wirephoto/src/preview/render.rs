@@ -29,6 +29,11 @@ pub enum Encoder {
     /// The cached size: jpegli, ~15% smaller at equal quality (design.md, Previews). Built without the `jpegli`
     /// feature, libjpeg-turbo with Huffman optimisation.
     Cache,
+    /// 160 and 320 px made from the cached 640: libjpeg-turbo at a lower quality. Their source already carries
+    /// the 640's compression, so a higher quality mostly spends bytes keeping it (measured on 50 camera photos
+    /// against references made from the 2560 px preview, SSIMULACRA2 / KB at 320 px: q70 63.5 / 9.5, q80 65.6 /
+    /// 11.6).
+    Small,
 }
 
 const GREY: u8 = 128; // what transparent areas are composited onto
@@ -294,8 +299,8 @@ pub fn encode(img: &Rgb, encoder: Encoder) -> anyhow::Result<Vec<u8>> {
     }
     let mut c = turbojpeg::Compressor::new()?;
     c.set_subsamp(Subsamp::Sub2x2)?;
-    c.set_quality(80)?;
-    c.set_optimize(encoder == Encoder::Cache)?;
+    c.set_quality(if encoder == Encoder::Small { 70 } else { 80 })?;
+    c.set_optimize(encoder != Encoder::Turbo)?;
     let image = turbojpeg::Image {
         pixels: &img.px[..],
         width: img.w as usize,

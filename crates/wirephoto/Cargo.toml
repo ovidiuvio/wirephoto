@@ -39,6 +39,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 subtle = "2.6.1"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
@@ -53,9 +54,6 @@ wirephoto-api = { path = "../wirephoto-api" }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
 seccompiler = "0.5.0"
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 [features]
 default = ["heic", "jpegli"]
