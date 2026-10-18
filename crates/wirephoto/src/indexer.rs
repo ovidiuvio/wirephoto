@@ -836,6 +836,7 @@ pub async fn background(app: Arc<App>) {
         tracing::warn!("resetting failed previews: {e:#}");
     }
     tokio::spawn(facts_loop(app.clone()));
+    tokio::spawn(hash_loop(app.clone()));
     let mut changes = app.seq.subscribe();
     loop {
         if paused(&app) {
@@ -879,9 +880,8 @@ pub async fn background(app: Arc<App>) {
                 }
             }
         }
-        // Previews here; facts in their own loop beside this one (facts_loop), so reading files never waits for
-        // a slow preview and previews start with the first files read. Hashing (whole-file reads) waits until
-        // both are idle.
+        // Previews here; facts and hashes in loops of their own beside this one (facts_loop, hash_loop): previews
+        // are CPU work, hashing is disk work and reading facts is light, so none waits for another to finish.
         let previews = match preview_pass(&app).await {
             Ok(n) => n,
             Err(e) => {
@@ -889,22 +889,7 @@ pub async fn background(app: Arc<App>) {
                 0
             }
         };
-        let hashes = if previews == 0 && facts_pending(&app) == 0 {
-            // Whole-file reads compete with downloads: hashing waits until the API is idle.
-            app.yield_to_requests().await;
-            let a = app.clone();
-            match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    tracing::warn!("hash pass: {e:#}");
-                    0
-                }
-                Err(_) => 0,
-            }
-        } else {
-            0
-        };
-        if previews + hashes == 0 {
+        if previews == 0 {
             // New facts make new previews to do: the change sequence moves with every one stored.
             tokio::select! {
                 _ = app.work.notified() => {}
@@ -962,17 +947,32 @@ async fn facts_loop(app: Arc<App>) {
     }
 }
 
-/// Files whose facts are still to be read, all libraries (an indexed count).
-fn facts_pending(app: &App) -> i64 {
-    app.db
-        .read(|c| {
-            Ok(c.query_row(
-                "SELECT COUNT(*) FROM entries WHERE media_state = 0 AND trashed_at IS NULL AND missing = 0",
-                [],
-                |r| r.get(0),
-            )?)
-        })
-        .unwrap_or(0)
+/// Hashes files beside the other loops: whole-file reads, so it waits while the API is in use (they compete
+/// with downloads for the disk) and otherwise runs alongside the previews, which need the CPU instead.
+async fn hash_loop(app: Arc<App>) {
+    let mut changes = app.seq.subscribe();
+    loop {
+        if paused(&app) {
+            tokio::time::sleep(PAUSE_CHECK).await;
+            continue;
+        }
+        app.yield_to_requests().await;
+        let a = app.clone();
+        let n = match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::warn!("hash pass: {e:#}");
+                0
+            }
+            Err(_) => 0,
+        };
+        if n == 0 && !app.api_busy() {
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
+    }
 }
 
 /// Hourly upkeep: empties expired trash, prunes old changes; flushes and trims the preview cache.

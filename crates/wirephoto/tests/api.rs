@@ -1668,3 +1668,57 @@ async fn only_if_cached_never_renders_from_the_original() {
         "never larger than the original"
     );
 }
+
+#[tokio::test]
+async fn hashing_runs_beside_previews_not_after_them() {
+    // Decode workers that take 8 s to start, on a fresh server (no worker started yet): the first
+    // preview is stuck for the whole test.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("slow.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsleep 8\nexec {:?} \"$@\"\n",
+            env!("CARGO_BIN_EXE_wirephoto")
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let lib = dir.path().join("photos");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("a.jpg"), jpeg(500, 400)).unwrap();
+    let config: wirephoto::config::Config = toml::from_str(&format!(
+        "data = {:?}\n[[library]]\nid = 'nas'\nname = 'NAS'\npath = {:?}\nwatch = 'poll'\npoll_seconds = 3600\n[decode]\nprogram = {script:?}\nworkers = 1\n",
+        dir.path().join("data"),
+        lib
+    ))
+    .unwrap();
+    let (app, _router) = wirephoto::build(config).unwrap();
+    let (a, l) = (app.clone(), app.libraries[0].clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::spawn(wirephoto::indexer::background(app.clone()));
+    let row = || {
+        let l = app.libraries[0].api_id.clone();
+        app.db
+            .read(move |c| Ok(wirephoto::db::entry_by_path(c, &l, "a.jpg")?))
+            .unwrap()
+            .unwrap()
+    };
+    let mut hashed = false;
+    for _ in 0..50 {
+        if row().sha256.is_some() {
+            hashed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(app.previews.disk().total_bytes(), 0, "the preview is still stuck");
+    assert!(
+        hashed,
+        "yet the file is hashed: hashing does not wait for previews"
+    );
+}
