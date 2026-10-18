@@ -29,5 +29,5 @@ pregenerate = true       # make the 640 px preview of every photo ahead of time
 
 # Previews are decoded in sandboxed `wirephoto decode` worker processes.
 # [decode]
-# workers = 0            # previews rendered at once; 0: one per CPU
+# workers = 0            # previews rendered at once (half of them for pre-generation); 0: one per CPU
 # ffmpeg = "/usr/bin/ffmpeg"  # video posters and durations (ffprobe next to it); default: from PATH

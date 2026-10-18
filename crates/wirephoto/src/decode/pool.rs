@@ -126,7 +126,8 @@ impl Pool {
                     tracing::warn!(?status, in_a_row = n, "decode worker lost: {e:#}");
                 }
                 if n >= 3 {
-                    let wait = Duration::from_millis(100u64 << (n - 3).min(9)).min(Duration::from_secs(30));
+                    let wait = Duration::from_millis(100u64 << (n - 3).min(9))
+                        .min(Duration::from_secs(30));
                     std::thread::sleep(wait);
                 }
                 Err(e.context("decode worker lost"))

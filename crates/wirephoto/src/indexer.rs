@@ -312,96 +312,227 @@ pub struct Watching {
     watcher: Option<notify::RecommendedWatcher>,
     rx: tokio::sync::mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     root: std::path::PathBuf,
+    /// Folders watched, relative ("" is the root): one watch each, on Linux.
+    watched: HashSet<String>,
+}
+
+/// On Linux every indexed folder gets its own watch (inotify), so what the index ignores is never watched:
+/// Synology keeps a hidden `@eaDir` folder per PHOTO, which alone can exceed the system's watch limit
+/// (`fs.inotify.max_user_watches`, often 8192). Elsewhere (FSEvents on macOS: no such limit) one recursive watch
+/// on the root.
+/// (`WIREPHOTO_WATCH_PER_FOLDER=1` forces per-folder watches anywhere, for tests.)
+fn per_folder() -> bool {
+    cfg!(target_os = "linux") || std::env::var_os("WIREPHOTO_WATCH_PER_FOLDER").is_some()
+}
+
+/// Every indexed folder of a library, relative ("" is the root).
+fn indexed_folders(app: &App, lib: &Library) -> anyhow::Result<Vec<String>> {
+    app.db.read(|c| {
+        let mut st = c.prepare(
+            "SELECT path FROM entries WHERE library = ? AND kind = 0 AND trashed_at IS NULL AND missing = 0",
+        )?;
+        let rows = st.query_map([&lib.api_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+}
+
+/// Watches each folder not watched yet, one level each. An error only when the system's watch limit is reached
+/// (a folder gone meanwhile is skipped).
+fn add_watches(
+    w: &mut notify::RecommendedWatcher,
+    root: &Path,
+    watched: &mut HashSet<String>,
+    rels: impl IntoIterator<Item = String>,
+) -> notify::Result<Vec<String>> {
+    use notify::Watcher;
+    let mut added = Vec::new();
+    for rel in rels {
+        if watched.contains(&rel) {
+            continue;
+        }
+        let p = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&rel)
+        };
+        match w.watch(&p, notify::RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watched.insert(rel.clone());
+                added.push(rel);
+            }
+            Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Ok(added)
 }
 
 /// Registers the watcher BEFORE the library's scan, so nothing that changes during the scan is missed: its
 /// events wait in the queue and are applied once the scan is done ([`watch`]). Applying them during the scan
 /// instead would run a pass's end (deleting what is missing) while the scan has not yet seen where a moved
-/// entry went.
-pub fn begin_watch(lib: &Library) -> Watching {
+/// entry went. On Linux the folders known from the last run are watched now and the ones the scan finds after it.
+pub fn begin_watch(app: &App, lib: &Library) -> Watching {
     use notify::Watcher;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
     let root = std::fs::canonicalize(&lib.fs.root).unwrap_or_else(|_| lib.fs.root.clone());
-    let watch_root = root.clone();
-    let watcher =
-        if lib.cfg.watch == crate::config::WatchMode::Poll {
-            None
-        } else {
-            notify::recommended_watcher(move |ev| {
-            let _ = tx.send(ev);
-        })
-        .and_then(|mut w| w.watch(&watch_root, notify::RecursiveMode::Recursive).map(|_| w))
-        .map_err(
-            |e| tracing::warn!(library = %lib.api_id, "watching unavailable, polling instead: {e}"),
+    let mut watched = HashSet::new();
+    let unavailable = |e: &dyn std::fmt::Display| {
+        tracing::warn!(
+            library = %lib.api_id,
+            "watching unavailable, polling every {} s instead: {e} (raise fs.inotify.max_user_watches to watch)",
+            lib.cfg.poll_seconds.max(5)
         )
-        .ok()
-        };
-    Watching { watcher, rx, root }
+    };
+    let watcher = if lib.cfg.watch == crate::config::WatchMode::Poll {
+        None
+    } else {
+        match notify::recommended_watcher(move |ev| {
+            let _ = tx.send(ev);
+        }) {
+            Err(e) => {
+                unavailable(&e);
+                None
+            }
+            Ok(mut w) if per_folder() => {
+                let mut rels = indexed_folders(app, lib).unwrap_or_default();
+                rels.push(String::new());
+                match add_watches(&mut w, &root, &mut watched, rels) {
+                    Ok(_) => Some(w),
+                    Err(e) => {
+                        unavailable(&e);
+                        None
+                    }
+                }
+            }
+            Ok(mut w) => match w.watch(&root, notify::RecursiveMode::Recursive) {
+                Ok(()) => Some(w),
+                Err(e) => {
+                    unavailable(&e);
+                    None
+                }
+            },
+        }
+    };
+    Watching {
+        watcher,
+        rx,
+        root,
+        watched,
+    }
 }
 
 /// Applies a library's changes from then on: the queued and new filesystem events when watching, polling
-/// otherwise.
+/// otherwise (or once the watch limit is reached).
 pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
     let Watching {
         watcher,
         mut rx,
         root,
+        mut watched,
     } = watching;
     lib.live.store(watcher.is_some(), Ordering::Relaxed);
-    if let Some(watcher) = watcher {
-        let (app, lib) = (app.clone(), lib.clone());
-        tokio::spawn(async move {
-            let _watcher = watcher; // lives as long as the task
-            loop {
-                let Some(first) = rx.recv().await else { break };
-                let mut dirs = HashSet::new();
-                let mut overflow = false;
-                let mut take =
-                    |ev: notify::Result<notify::Event>, dirs: &mut HashSet<String>| match ev {
-                        Ok(ev) => {
-                            if ev.need_rescan() {
-                                overflow = true;
-                            }
-                            for p in ev.paths {
-                                if let Some(rel) = relative(&root, &p, &lib) {
-                                    dirs.insert(fsx::parent_of(&rel).to_string());
-                                    dirs.insert(rel); // a folder's own contents, when the event names a folder
-                                }
-                            }
-                        }
-                        Err(e) => tracing::debug!("watch error: {e}"),
-                    };
-                take(first, &mut dirs);
-                // Settle: collect what arrives in the next moment as one batch.
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                while let Ok(ev) = rx.try_recv() {
-                    take(ev, &mut dirs);
-                }
-                let (app2, lib2) = (app.clone(), lib.clone());
-                let res = tokio::task::spawn_blocking(move || {
-                    if overflow {
-                        poll(&app2, &lib2)
-                    } else {
-                        sync_paths(&app2, &lib2, dirs)
+    let Some(mut watcher) = watcher else {
+        tokio::spawn(poll_forever(app, lib));
+        return;
+    };
+    tokio::spawn(async move {
+        // Folders the scan found that the last run did not know.
+        if per_folder()
+            && let Err(e) = watch_new_folders(&app, &lib, &mut watcher, &root, &mut watched).await
+        {
+            tracing::warn!(library = %lib.api_id, "watch limit reached, polling instead: {e} (raise fs.inotify.max_user_watches to watch)");
+            lib.live.store(false, Ordering::Relaxed);
+            drop(watcher);
+            return poll_forever(app, lib).await;
+        }
+        loop {
+            let Some(first) = rx.recv().await else { break };
+            let mut dirs = HashSet::new();
+            let mut overflow = false;
+            let mut take = |ev: notify::Result<notify::Event>, dirs: &mut HashSet<String>| match ev
+            {
+                Ok(ev) => {
+                    if ev.need_rescan() {
+                        overflow = true;
                     }
-                })
+                    for p in ev.paths {
+                        if let Some(rel) = relative(&root, &p, &lib) {
+                            dirs.insert(fsx::parent_of(&rel).to_string());
+                            dirs.insert(rel); // a folder's own contents, when the event names a folder
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("watch error: {e}"),
+            };
+            take(first, &mut dirs);
+            // Settle: collect what arrives in the next moment as one batch.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok(ev) = rx.try_recv() {
+                take(ev, &mut dirs);
+            }
+            let (app2, lib2) = (app.clone(), lib.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                if overflow {
+                    poll(&app2, &lib2)
+                } else {
+                    sync_paths(&app2, &lib2, dirs)
+                }
+            })
+            .await;
+            if let Ok(Err(e)) = res {
+                tracing::warn!(library = %lib.api_id, "sync failed: {e:#}");
+            }
+            if per_folder()
+                && let Err(e) =
+                    watch_new_folders(&app, &lib, &mut watcher, &root, &mut watched).await
+            {
+                tracing::warn!(library = %lib.api_id, "watch limit reached, polling instead: {e} (raise fs.inotify.max_user_watches to watch)");
+                lib.live.store(false, Ordering::Relaxed);
+                drop(watcher);
+                return poll_forever(app, lib).await;
+            }
+        }
+    });
+}
+
+/// Watches the indexed folders not watched yet, then lists the new ones again: files that arrived between a
+/// folder's listing and its watch are not missed. Listing may find folders that are new in turn (made in that
+/// gap), so it repeats until there are none.
+async fn watch_new_folders(
+    app: &Arc<App>,
+    lib: &Arc<Library>,
+    watcher: &mut notify::RecommendedWatcher,
+    root: &Path,
+    watched: &mut HashSet<String>,
+) -> notify::Result<()> {
+    for _ in 0..32 {
+        let (a, l) = (app.clone(), lib.clone());
+        let rels = tokio::task::spawn_blocking(move || indexed_folders(&a, &l))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let added = add_watches(watcher, root, watched, rels)?;
+        if added.is_empty() {
+            break;
+        }
+        let (a, l) = (app.clone(), lib.clone());
+        let _ =
+            tokio::task::spawn_blocking(move || sync_paths(&a, &l, added.into_iter().collect()))
                 .await;
-                if let Ok(Err(e)) = res {
-                    tracing::warn!(library = %lib.api_id, "sync failed: {e:#}");
-                }
-            }
-        });
-    } else {
-        let every = Duration::from_secs(lib.cfg.poll_seconds.max(5));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(every).await;
-                let (a, l) = (app.clone(), lib.clone());
-                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || poll(&a, &l)).await {
-                    tracing::warn!(library = %lib.api_id, "poll failed: {e:#}");
-                }
-            }
-        });
+    }
+    Ok(())
+}
+
+/// Polls the library every `poll_seconds`, for good.
+async fn poll_forever(app: Arc<App>, lib: Arc<Library>) {
+    let every = Duration::from_secs(lib.cfg.poll_seconds.max(5));
+    loop {
+        tokio::time::sleep(every).await;
+        let (a, l) = (app.clone(), lib.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || poll(&a, &l)).await {
+            tracing::warn!(library = %lib.api_id, "poll failed: {e:#}");
+        }
     }
 }
 
@@ -696,6 +827,8 @@ pub async fn background(app: Arc<App>) {
     if let Err(e) = retry_failed_previews(&app) {
         tracing::warn!("resetting failed previews: {e:#}");
     }
+    tokio::spawn(facts_loop(app.clone()));
+    let mut changes = app.seq.subscribe();
     loop {
         for lib in &app.libraries {
             if lib
@@ -734,17 +867,9 @@ pub async fn background(app: Arc<App>) {
                 }
             }
         }
-        // Facts and previews take turns, a batch each: thumbnails start with the first files read instead of
-        // after the whole library. Hashing (whole-file reads) waits until both are idle.
-        let a = app.clone();
-        let facts = match tokio::task::spawn_blocking(move || media_pass(&a)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                tracing::warn!("media pass: {e:#}");
-                0
-            }
-            Err(_) => 0,
-        };
+        // Previews here; facts in their own loop beside this one (facts_loop), so reading files never waits for
+        // a slow preview and previews start with the first files read. Hashing (whole-file reads) waits until
+        // both are idle.
         let previews = match preview_pass(&app).await {
             Ok(n) => n,
             Err(e) => {
@@ -752,7 +877,7 @@ pub async fn background(app: Arc<App>) {
                 0
             }
         };
-        let hashes = if facts == 0 && previews == 0 {
+        let hashes = if previews == 0 && facts_pending(&app) == 0 {
             let a = app.clone();
             match tokio::task::spawn_blocking(move || hash_pass(&a)).await {
                 Ok(Ok(n)) => n,
@@ -765,14 +890,50 @@ pub async fn background(app: Arc<App>) {
         } else {
             0
         };
-        let did = facts + previews + hashes > 0;
-        if !did {
+        if previews + hashes == 0 {
+            // New facts make new previews to do: the change sequence moves with every one stored.
             tokio::select! {
                 _ = app.work.notified() => {}
+                _ = changes.changed() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
         }
     }
+}
+
+/// Reads media facts as fast as the disk allows, beside the preview loop.
+async fn facts_loop(app: Arc<App>) {
+    let mut changes = app.seq.subscribe();
+    loop {
+        let a = app.clone();
+        let n = match tokio::task::spawn_blocking(move || media_pass(&a)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::warn!("media pass: {e:#}");
+                0
+            }
+            Err(_) => 0,
+        };
+        if n == 0 {
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
+    }
+}
+
+/// Files whose facts are still to be read, all libraries (an indexed count).
+fn facts_pending(app: &App) -> i64 {
+    app.db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM entries WHERE media_state = 0 AND trashed_at IS NULL AND missing = 0",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap_or(0)
 }
 
 /// Hourly upkeep: empties expired trash, prunes old changes; flushes and trims the preview cache.
@@ -954,47 +1115,51 @@ pub async fn report(app: Arc<App>) {
             let Ok(now) = counts else { continue };
             let previews_pending = if pregenerate { now.previews_pending } else { 0 };
             let busy = now.facts_pending + previews_pending + now.hashes_pending > 0;
-            let stage = |name: &str, pending: u64, before: u64, total: u64| -> Option<String> {
-                if pending == 0 {
-                    return None;
-                }
-                let rate = before.saturating_sub(pending) as f64 / EVERY.as_secs_f64();
-                let left = if rate > 0.0 && was_busy {
-                    format!(", {} left", duration_words(pending as f64 / rate))
-                } else {
-                    String::new()
+            // Speed from what got DONE since the last line, not from what is left: new files keep arriving
+            // in a stage's queue while it works (reading files feeds previews), so "left" can stand still.
+            let stage =
+                |name: &str, pending: u64, total: u64, done_before: u64| -> Option<String> {
+                    if pending == 0 {
+                        return None;
+                    }
+                    let done = total - pending;
+                    let rate = done.saturating_sub(done_before) as f64 / EVERY.as_secs_f64();
+                    let left = if rate > 0.0 && was_busy {
+                        format!(", {} left", duration_words(pending as f64 / rate))
+                    } else {
+                        String::new()
+                    };
+                    let speed = match (was_busy, rate > 0.0) {
+                        (true, true) => format!(" ({rate:.1}/s{left})"),
+                        // Hashing waits for facts and previews; anything not moving is queued behind them.
+                        (true, false) => " (waiting)".to_string(),
+                        _ => String::new(),
+                    };
+                    Some(format!(
+                        "{name} {} / {}{speed}",
+                        thousands(total - pending),
+                        thousands(total)
+                    ))
                 };
-                let speed = match (was_busy, rate > 0.0) {
-                    (true, true) => format!(" ({rate:.1}/s{left})"),
-                    // Hashing waits for facts and previews; anything not moving is queued behind them.
-                    (true, false) => " (waiting)".to_string(),
-                    _ => String::new(),
-                };
-                Some(format!(
-                    "{name} {} / {}{speed}",
-                    thousands(total - pending),
-                    thousands(total)
-                ))
-            };
             if busy {
                 let parts: Vec<String> = [
                     stage(
                         "reading files",
                         now.facts_pending,
-                        prev.facts_pending,
                         now.files,
+                        prev.files - prev.facts_pending,
                     ),
                     stage(
                         "previews",
                         previews_pending,
-                        prev.previews_pending,
                         now.previews_pending + now.previews_done,
+                        prev.previews_done,
                     ),
                     stage(
                         "hashing",
                         now.hashes_pending,
-                        prev.hashes_pending,
                         now.files,
+                        prev.files - prev.hashes_pending,
                     ),
                 ]
                 .into_iter()

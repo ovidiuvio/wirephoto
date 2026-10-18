@@ -16,8 +16,9 @@ pub fn enter() -> anyhow::Result<()> {
 
     // SAFETY: plain syscalls on this process, before any other thread exists.
     unsafe {
-        // Die with the server.
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        // No PR_SET_PDEATHSIG: it fires when the THREAD that started the worker exits, and workers are started
+        // from the server's blocking-pool threads, which retire after a few idle seconds. That killed workers
+        // mid-decode. A worker leaves when the server does anyway: its socket closes and it reads end of file.
         if libc::geteuid() == 0 || libc::getegid() == 0 {
             const NOBODY: u32 = 65534;
             if libc::setgroups(0, std::ptr::null()) != 0
@@ -182,7 +183,9 @@ pub fn enter() -> anyhow::Result<()> {
             }
             unfiltered(std::io::Error::last_os_error())
         }
-        Err(seccompiler::Error::Seccomp(e)) if e.raw_os_error() == Some(libc::EINVAL) => unfiltered(e),
+        Err(seccompiler::Error::Seccomp(e)) if e.raw_os_error() == Some(libc::EINVAL) => {
+            unfiltered(e)
+        }
         Err(e) => Err(e.into()),
     }
 }

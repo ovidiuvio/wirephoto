@@ -1284,7 +1284,7 @@ async fn changes_between_registering_the_watcher_and_applying_it_are_kept() {
     .unwrap();
     let (app, _router) = wirephoto::build(config).unwrap();
     let l = app.libraries[0].clone();
-    let watching = wirephoto::indexer::begin_watch(&l);
+    let watching = wirephoto::indexer::begin_watch(&app, &l);
     let (a, l2) = (app.clone(), l.clone());
     tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l2))
         .await
@@ -1403,5 +1403,67 @@ async fn a_crash_during_pregeneration_defers_and_a_restart_retries() {
         count(done),
         3,
         "a.jpg, b.jpg and logo.png all have their preview"
+    );
+}
+
+#[tokio::test]
+async fn per_folder_watches_follow_new_folders_and_skip_ignored_ones() {
+    // SAFETY: tests that read it only ever see it set; per-folder watching is what Linux always does.
+    unsafe { std::env::set_var("WIREPHOTO_WATCH_PER_FOLDER", "1") };
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("photos");
+    std::fs::create_dir_all(lib.join("in/@eaDir/x.jpg")).unwrap();
+    std::fs::write(lib.join("in/a.jpg"), jpeg(400, 300)).unwrap();
+    let config: wirephoto::config::Config = toml::from_str(&format!(
+        "data = {:?}\n[[library]]\nid = 'nas'\nname = 'NAS'\npath = {:?}\nwatch = 'auto'\n[decode]\nprogram = {:?}\n[cache]\npregenerate = false\n",
+        dir.path().join("data"),
+        lib,
+        env!("CARGO_BIN_EXE_wirephoto")
+    ))
+    .unwrap();
+    let (app, _router) = wirephoto::build(config).unwrap();
+    let l = app.libraries[0].clone();
+    let watching = wirephoto::indexer::begin_watch(&app, &l);
+    let (a, l2) = (app.clone(), l.clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l2))
+        .await
+        .unwrap()
+        .unwrap();
+    wirephoto::indexer::watch(app.clone(), l.clone(), watching);
+    let has = |path: &'static str| {
+        let (app, l) = (app.clone(), l.clone());
+        async move {
+            for _ in 0..100 {
+                if app
+                    .db
+                    .read(|c| Ok(wirephoto::db::entry_by_path(c, &l.api_id, path)?))
+                    .unwrap()
+                    .is_some()
+                {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            false
+        }
+    };
+    // A folder made after start, then a file in it: the folder gets its own watch.
+    std::fs::create_dir(lib.join("in/new")).unwrap();
+    assert!(has("in/new").await, "the new folder is indexed");
+    // Time for the new watch to be in place: immediate with inotify (Linux); macOS's FSEvents restarts its
+    // stream to add a path, which takes a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    std::fs::write(lib.join("in/new/b.jpg"), jpeg(400, 300)).unwrap();
+    assert!(
+        has("in/new/b.jpg").await,
+        "a file in the new folder is seen"
+    );
+    assert!(
+        l.live.load(std::sync::atomic::Ordering::Relaxed),
+        "still watching, not polling"
+    );
+    assert!(
+        !has("in/@eaDir").await || false,
+        "ignored folders are neither indexed nor watched"
     );
 }

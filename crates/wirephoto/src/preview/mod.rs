@@ -118,7 +118,8 @@ impl Previews {
                 .time_to_idle(Duration::from_secs(600))
                 .build(),
             interactive: Arc::new(Semaphore::new(cpus)),
-            background: Arc::new(Semaphore::new((cpus / 4).max(1))),
+            // Half the renderings for pre-generation (a NAS is mostly idle otherwise); requests get the rest.
+            background: Arc::new(Semaphore::new((cpus / 2).max(1))),
             renders: Arc::new(AtomicU64::new(0)),
         }
     }
