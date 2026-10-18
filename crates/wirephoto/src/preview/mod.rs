@@ -1,6 +1,8 @@
 //! Previews (design.md, Previews): memory cache, then the disk cache, then rendering in a decode worker
-//! ([`crate::decode`]). Identical requests coalesce into one rendering; a rendering nobody waits for any more is
-//! dropped with its request before it reaches a worker (one already in a worker finishes and is cached).
+//! ([`crate::decode`]). Every rendering of a preview — for requests and for background pre-generation alike —
+//! goes through the memory cache's `try_get_with`, so whoever asks second waits for the rendering in progress
+//! instead of starting another. A rendering nobody waits for any more is dropped with its request before it
+//! reaches a worker (one already in a worker finishes and is cached).
 //!
 //! Sizes below the cached 640 px are made from it, not from the original, and kept in memory only: shrinking our
 //! own 640 px JPEG takes 0.4-1.2 ms (measured, one M2 Max core) where decoding a 40 MP original takes tens to
@@ -11,6 +13,7 @@ pub mod inspect;
 pub mod render;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -49,6 +52,8 @@ pub struct Previews {
     /// Background pre-generation, kept to a share of the CPUs.
     background: Arc<Semaphore>,
     pool: Arc<Pool>,
+    /// Renderings from originals so far (for tests and debugging).
+    renders: Arc<AtomicU64>,
 }
 
 pub fn key(entry: &EntryRow, size: u32) -> String {
@@ -78,6 +83,7 @@ impl Previews {
                 .build(),
             interactive: Arc::new(Semaphore::new(cpus)),
             background: Arc::new(Semaphore::new((cpus / 4).max(1))),
+            renders: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -87,6 +93,11 @@ impl Previews {
 
     pub fn pool(&self) -> &Arc<Pool> {
         &self.pool
+    }
+
+    /// How many previews have been rendered from originals since start.
+    pub fn renders(&self) -> u64 {
+        self.renders.load(Ordering::Relaxed)
     }
 
     /// A cached preview, without rendering.
@@ -161,55 +172,89 @@ impl Previews {
         if let Some(b) = self.cached(&k).await {
             return Ok(b);
         }
-        let (entry, disk, sem) = (entry.clone(), self.disk.clone(), self.interactive.clone());
-        let (kk, pool) = (k.clone(), self.pool.clone());
+        let job = self.job(entry, src, size, &k);
+        let sem = self.interactive.clone();
         self.mem
             .try_get_with(k, async move {
-                render_and_store(entry, src, size, kk, disk, sem, pool).await
+                let _permit = sem.acquire_owned().await?;
+                job.run().await
             })
             .await
             .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))
     }
 
     /// Makes sure the cached size exists (background pre-generation). Returns whether it rendered.
+    ///
+    /// The background slot is taken BEFORE joining the memory cache's coalescing: a request arriving while this
+    /// waits for a slot renders at once on its own (interactive) slots rather than queueing behind pre-generation,
+    /// and this then finds its result. A rendering of ours that a request joins hands it the bytes; once done,
+    /// the preview is dropped from memory again, so pre-generating a library does not push out what people are
+    /// looking at.
     pub async fn ensure_cached(&self, entry: &EntryRow, src: Source) -> anyhow::Result<bool> {
         let k = key(entry, CACHED_SIZE);
-        let disk = self.disk.clone();
-        let kk = k.clone();
-        if tokio::task::spawn_blocking(move || disk.contains(&kk)).await?? {
+        if self.on_disk(&k).await? {
             return Ok(false);
         }
-        render_and_store(
-            entry.clone(),
+        let _permit = self.background.clone().acquire_owned().await?;
+        let job = self.job(entry, src, CACHED_SIZE, &k);
+        let before = self.renders();
+        let res = self
+            .mem
+            .entry(k.clone())
+            .or_try_insert_with(async move { job.run().await })
+            .await
+            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))?;
+        // `is_fresh`: this call's own initializer ran (no request was rendering it, nothing was in memory).
+        if res.is_fresh() {
+            self.mem.invalidate(&k).await;
+        }
+        Ok(self.renders() > before && res.is_fresh())
+    }
+
+    async fn on_disk(&self, k: &str) -> anyhow::Result<bool> {
+        let (disk, k) = (self.disk.clone(), k.to_string());
+        tokio::task::spawn_blocking(move || disk.contains(&k)).await?
+    }
+
+    fn job(&self, entry: &EntryRow, src: Source, size: u32, k: &str) -> RenderJob {
+        RenderJob {
+            entry: entry.clone(),
             src,
-            CACHED_SIZE,
-            k,
-            self.disk.clone(),
-            self.background.clone(),
-            self.pool.clone(),
-        )
-        .await?;
-        Ok(true)
+            size,
+            key: k.to_string(),
+            disk: self.disk.clone(),
+            pool: self.pool.clone(),
+            renders: self.renders.clone(),
+        }
     }
 }
 
-async fn render_and_store(
+/// One preview rendered from its original and stored on disk. The caller holds a rendering slot.
+struct RenderJob {
     entry: EntryRow,
     src: Source,
     size: u32,
     key: String,
     disk: Arc<cache::DiskCache>,
-    sem: Arc<Semaphore>,
     pool: Arc<Pool>,
-) -> anyhow::Result<Bytes> {
-    let _permit = sem.acquire_owned().await?;
-    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let jpeg = render(&pool, &entry, &src, size)?;
-        disk.put(&key, &jpeg)?;
-        Ok(jpeg)
-    })
-    .await??;
-    Ok(Bytes::from(out))
+    renders: Arc<AtomicU64>,
+}
+
+impl RenderJob {
+    async fn run(self) -> anyhow::Result<Bytes> {
+        let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            // Made while this waited for its slot (by a request, or by a server since restarted)?
+            if let Some(jpeg) = self.disk.get(&self.key)? {
+                return Ok(jpeg);
+            }
+            self.renders.fetch_add(1, Ordering::Relaxed);
+            let jpeg = render(&self.pool, &self.entry, &self.src, self.size)?;
+            self.disk.put(&self.key, &jpeg)?;
+            Ok(jpeg)
+        })
+        .await??;
+        Ok(Bytes::from(out))
+    }
 }
 
 /// A smaller preview from a cached one (our own baseline sRGB JPEG, so it is decoded here, not in a worker):

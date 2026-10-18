@@ -1122,3 +1122,45 @@ async fn videos_without_ffmpeg() {
         .await;
     assert_eq!(r.status, 415);
 }
+
+#[tokio::test]
+async fn background_and_request_render_once() {
+    let t = setup_with("[cache]\npregenerate = false\n").await;
+    let lib = t.app.libraries[0].clone();
+    let row = |path: &str| {
+        let p = path.to_string();
+        t.app
+            .db
+            .read(|c| Ok(wirephoto::db::entry_by_path(c, &lib.api_id, &p)?))
+            .unwrap()
+            .unwrap()
+    };
+    let src = |path: &str| wirephoto::preview::Source::File(lib.fs.clone(), path.to_string());
+    let previews = &t.app.previews;
+    assert_eq!(previews.renders(), 0);
+
+    // Together: whichever starts second waits for the first.
+    let a = row("2026/Lisbon/a.jpg");
+    let (bg, req) = tokio::join!(
+        previews.ensure_cached(&a, src("2026/Lisbon/a.jpg")),
+        previews.get(&a, src("2026/Lisbon/a.jpg"), 640),
+    );
+    bg.unwrap();
+    assert!(!req.unwrap().0.is_empty());
+    assert_eq!(previews.renders(), 1, "one rendering for both");
+
+    // A request first: pre-generation finds it and renders nothing.
+    let b = row("2026/Lisbon/b.jpg");
+    previews
+        .get(&b, src("2026/Lisbon/b.jpg"), 320)
+        .await
+        .unwrap();
+    assert_eq!(previews.renders(), 2);
+    assert!(
+        !previews
+            .ensure_cached(&b, src("2026/Lisbon/b.jpg"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(previews.renders(), 2);
+}
