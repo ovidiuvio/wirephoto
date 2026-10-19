@@ -63,7 +63,8 @@ pub struct LogConfig {
     /// Days of log files kept.
     #[serde(default = "default_keep_days")]
     pub keep_days: usize,
-    /// One line per API request: method, path, status, time, size, key, client.
+    /// One line per API request: method, path, status, time, size, key, client. With `file`, in a file of its
+    /// own, `<data>/logs/access.log.<date>` (and not in the other logs); without, in the console log.
     #[serde(default = "yes")]
     pub access: bool,
     /// Days the audit trail (changes, refused requests, key changes; `wirephoto audit`) is kept in the index.

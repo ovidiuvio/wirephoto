@@ -230,7 +230,7 @@ sudo docker exec wirephoto wirephoto status
 
 shows each library's progress and time left, how long previews take by file type (and decoder), the cache, the
 workers and the GPU. The log is in Container Manager (**Container → wirephoto → Log**) and one file a day in
-`/volume1/docker/wirephoto/logs`. `wirephoto pause` and `wirephoto resume` hold and continue the background work,
+`/volume1/docker/wirephoto/logs` (`wirephoto.log.<date>`), with every request in `access.log.<date>` beside it. `wirephoto pause` and `wirephoto resume` hold and continue the background work,
 also across restarts.
 
 ## 10. Updating

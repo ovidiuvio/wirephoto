@@ -540,13 +540,16 @@ fn human(bytes: u64) -> String {
 }
 
 /// The log: the console (`docker logs`) and, for the server, also a file a day in `<data>/logs` (`[log] file`),
-/// kept `keep_days`. `WIREPHOTO_LOG` filters both (default `wirephoto=info`).
+/// kept `keep_days`, with the access log (one line per request) in a file of its own there, `access.log.<date>`,
+/// and out of the others. `WIREPHOTO_LOG` filters them (default `wirephoto=info`).
 fn init_logging(
     config: &Config,
     serving: bool,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::prelude::*;
+    const ACCESS: &str = "wirephoto::access";
     // The other commands print their own results: only warnings from the log, unless asked.
     let filter = || {
         EnvFilter::try_from_env("WIREPHOTO_LOG").unwrap_or_else(|_| {
@@ -558,40 +561,60 @@ fn init_logging(
             .into()
         })
     };
+    let mut guards = Vec::new();
+    let dir = config.data.join("logs");
+    let mut daily = |prefix: &str| {
+        std::fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                Ok(tracing_appender::rolling::RollingFileAppender::builder()
+                    .rotation(tracing_appender::rolling::Rotation::DAILY)
+                    .filename_prefix(prefix)
+                    .max_log_files(config.log.keep_days.max(1))
+                    .build(&dir)?)
+            })
+            .map_err(|e| eprintln!("no log file in {}: {e:#}", dir.display()))
+            .ok()
+            .map(|appender| {
+                let (writer, g) = tracing_appender::non_blocking(appender);
+                guards.push(g);
+                writer
+            })
+    };
+    let files = serving && config.log.file;
+    let file = files.then(|| daily("wirephoto.log")).flatten();
+    let access = (files && config.log.access)
+        .then(|| daily("access.log"))
+        .flatten();
+    // Requests go to their own file when there is one, and only there.
+    let apart = access.is_some();
+    let not_access = move |m: &tracing::Metadata| !(apart && m.target() == ACCESS);
     let console = tracing_subscriber::fmt::layer()
         // Colour codes only for a terminal: a container log viewer shows them as junk.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .with_filter(filter());
-    let mut guard = None;
-    let file = (serving && config.log.file)
-        .then(|| {
-            let dir = config.data.join("logs");
-            std::fs::create_dir_all(&dir)
-                .map_err(anyhow::Error::from)
-                .and_then(|()| {
-                    Ok(tracing_appender::rolling::RollingFileAppender::builder()
-                        .rotation(tracing_appender::rolling::Rotation::DAILY)
-                        .filename_prefix("wirephoto.log")
-                        .max_log_files(config.log.keep_days.max(1))
-                        .build(&dir)?)
-                })
-                .map_err(|e| eprintln!("no log file in {}: {e:#}", dir.display()))
-                .ok()
-        })
-        .flatten()
-        .map(|appender| {
-            let (writer, g) = tracing_appender::non_blocking(appender);
-            guard = Some(g);
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(writer)
-                .with_filter(filter())
-        });
+        .with_filter(filter())
+        .with_filter(filter_fn(not_access));
+    let file = file.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_filter(filter())
+            .with_filter(filter_fn(not_access))
+    });
+    let access = access.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer)
+            .with_filter(filter())
+            .with_filter(filter_fn(|m| m.target() == ACCESS))
+    });
     tracing_subscriber::registry()
         .with(console)
         .with(file)
+        .with(access)
         .init();
-    guard
+    guards
 }
 
 /// `30m`, `24h`, `7d` as seconds.

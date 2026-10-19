@@ -45,5 +45,6 @@ pregenerate = true       # make the 640 px preview of every photo ahead of time
 # [log]
 # file = true            # also log to <data>/logs/wirephoto.log.<date> (survives a recreated container)
 # keep_days = 14         # log files kept
-# access = true          # one line per API request: method, path, status, time, size, key, client
+# access = true          # one line per API request (method, path, status, time, size, key, client), in
+#                        # <data>/logs/access.log.<date> (in the console log when file = false)
 # audit_days = 365       # audit trail kept in the index (`wirephoto audit`)

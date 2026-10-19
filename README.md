@@ -48,7 +48,7 @@ Keeping an eye on it (all run where the server runs, e.g. `docker compose exec w
 | `wirephoto cache stats\|list\|extract DIR` | Look inside the preview cache |
 
 The log (`docker logs`, and a file a day in `<data>/logs`) has a progress line every 30 seconds while there is
-work, one line per API request, and the audit trail. Background work never holds up requests: it runs at low CPU
+work, and the audit trail; one line per API request goes to its own file, `<data>/logs/access.log.<date>`. Background work never holds up requests: it runs at low CPU
 priority, and while the API is in use previews go one at a time and hashing waits.
 
 Browser apps on `https://` can only reach an `https://` server: give wirephoto a certificate (`[tls]` in the
