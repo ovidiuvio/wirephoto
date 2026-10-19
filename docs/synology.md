@@ -240,8 +240,11 @@ scripts. `wirephoto keys list` and `wirephoto keys revoke <name>` manage them.
 sudo docker exec wirephoto wirephoto status
 ```
 
-shows each library's progress and time left, how long previews take by file type (and decoder), the cache, the
-workers and the GPU. The log is in Container Manager (**Container → wirephoto → Log**) and one file a day in
+shows, labelled and explained, everything the server is doing: CPU and memory of the server and of its decode
+workers (for requests, for pre-generation, ffmpeg), storage, each library's contents and background work (done,
+to do, failed, rate, time left) and how it notices changes, requests by kind and preview size, how long previews
+made from originals take and where the time goes (waiting for a worker, decoding, encoding), caches, the GPU,
+API keys, uploads, and the last warnings and errors. `wirephoto status --json` gives the same for scripts. The log is in Container Manager (**Container → wirephoto → Log**) and one file a day in
 `/volume1/docker/wirephoto/logs` (`wirephoto.log.<date>`), with every request in `access.log.<date>` beside it. `wirephoto pause` and `wirephoto resume` hold and continue the background work,
 also across restarts.
 

@@ -23,61 +23,80 @@ impl std::ops::Add for Usage {
     }
 }
 
-/// The server's use, and that of everything it started (decode workers and their ffmpeg), with how many those
-/// are. `None` where /proc is not there (macOS) or the process is gone.
+/// A process the server started, or the server itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    /// The command's name (`wirephoto`, `ffmpeg`, ...).
+    pub comm: String,
+    /// Its niceness: background decode workers lower their priority.
+    pub nice: i64,
+    pub usage: Usage,
+}
+
+/// The server and everything it started (decode workers, their ffmpeg), the server first. `None` where /proc
+/// is not there (macOS) or the server is gone.
 #[cfg(target_os = "linux")]
-pub fn of_server(pid: u32) -> Option<(Usage, Usage, usize)> {
+pub fn family(pid: u32) -> Option<Vec<Proc>> {
     let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-    // (pid, parent, usage) of every process we may read.
-    let all: Vec<(u32, u32, Usage)> = std::fs::read_dir("/proc")
+    let all: Vec<Proc> = std::fs::read_dir("/proc")
         .ok()?
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter_map(|p| {
             let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
-            let (ppid, usage) = parse_stat(&stat, tick)?;
-            let rss = std::fs::read_to_string(format!("/proc/{p}/status"))
+            let mut proc = parse_stat(&stat, tick)?;
+            proc.pid = p;
+            proc.usage.rss = std::fs::read_to_string(format!("/proc/{p}/status"))
                 .ok()
                 .and_then(|s| vm_rss(&s))
                 .unwrap_or(0);
-            Some((p, ppid, Usage { rss, ..usage }))
+            Some(proc)
         })
         .collect();
-    let server = all.iter().find(|(p, ..)| *p == pid)?.2;
-    let mut family = vec![pid];
-    let mut children = Usage::default();
-    let mut n = 0;
-    while let Some(parent) = family.pop() {
-        for (p, pp, u) in &all {
-            if *pp == parent {
-                family.push(*p);
-                children = children + *u;
-                n += 1;
-            }
-        }
+    let mut out = vec![all.iter().find(|p| p.pid == pid)?.clone()];
+    let mut i = 0;
+    while i < out.len() {
+        let parent = out[i].pid;
+        out.extend(all.iter().filter(|p| p.ppid == parent).cloned());
+        i += 1;
     }
-    Some((server, children, n))
+    Some(out)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn of_server(_pid: u32) -> Option<(Usage, Usage, usize)> {
+pub fn family(_pid: u32) -> Option<Vec<Proc>> {
     None
 }
 
-/// `/proc/<pid>/stat` -> (parent, CPU time). The command name may hold spaces and brackets: fields are
-/// counted from the last `)`.
-pub fn parse_stat(stat: &str, ticks_per_sec: f64) -> Option<(u32, Usage)> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let f: Vec<&str> = rest.split_whitespace().collect();
+/// The server's use, and that of everything it started, with how many those are.
+pub fn of_server(pid: u32) -> Option<(Usage, Usage, usize)> {
+    let f = family(pid)?;
+    let children = f[1..].iter().fold(Usage::default(), |a, p| a + p.usage);
+    Some((f[0].usage, children, f.len() - 1))
+}
+
+/// `/proc/<pid>/stat` -> the process (its pid and memory left to the caller). The command name may hold
+/// spaces and brackets: fields are counted from the last `)`.
+pub fn parse_stat(stat: &str, ticks_per_sec: f64) -> Option<Proc> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?.to_string();
+    let f: Vec<&str> = stat[close + 1..].split_whitespace().collect();
     let ppid = f.get(1)?.parse().ok()?;
     let utime: f64 = f.get(11)?.parse().ok()?;
     let stime: f64 = f.get(12)?.parse().ok()?;
-    Some((
+    let nice = f.get(16)?.parse().ok()?;
+    Some(Proc {
+        pid: 0,
         ppid,
-        Usage {
+        comm,
+        nice,
+        usage: Usage {
             cpu_secs: (utime + stime) / ticks_per_sec,
             rss: 0,
         },
-    ))
+    })
 }
 
 /// `VmRSS:  123456 kB` from `/proc/<pid>/status`, in bytes.
@@ -101,9 +120,12 @@ mod tests {
     fn proc_files() {
         let stat = "4242 (wirephoto (de)code) S 4200 4242 4242 0 -1 4194560 2000 0 0 0 250 50 0 0 30 10 \
                     4 0 12345 1000000 2000 18446744073709551615";
-        let (ppid, u) = parse_stat(stat, 100.0).unwrap();
-        assert_eq!(ppid, 4200);
-        assert!((u.cpu_secs - 3.0).abs() < 1e-9);
+        let p = parse_stat(stat, 100.0).unwrap();
+        assert_eq!(
+            (p.ppid, p.comm.as_str(), p.nice),
+            (4200, "wirephoto (de)code", 10)
+        );
+        assert!((p.usage.cpu_secs - 3.0).abs() < 1e-9);
         assert_eq!(vm_rss("Name:\tx\nVmRSS:\t  2048 kB\n"), Some(2 << 20));
         assert!(disk(Path::new(".")).is_some_and(|(free, total)| free <= total && total > 0));
     }

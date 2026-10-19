@@ -279,11 +279,13 @@ impl Previews {
         if let Some((b, _)) = self.lookup(&k).await {
             return Ok(b);
         }
-        let job = self.job(entry, src, size, &k, self.pool.clone());
+        let mut job = self.job(entry, src, size, &k, self.pool.clone());
         let sem = self.interactive.clone();
         self.mem
             .try_get_with(k, async move {
+                let t = Instant::now();
                 let _permit = sem.acquire_owned().await?;
+                job.wait_ms = t.elapsed().as_millis() as u64;
                 job.run().await
             })
             .await
@@ -302,8 +304,11 @@ impl Previews {
         if self.on_disk(&k).await? {
             return Ok(false);
         }
+        let t = Instant::now();
         let _permit = self.background.clone().acquire_owned().await?;
-        let job = self.job(entry, src, CACHED_SIZE, &k, self.bg_pool.clone());
+        let mut job = self.job(entry, src, CACHED_SIZE, &k, self.bg_pool.clone());
+        job.purpose = "ahead";
+        job.wait_ms = t.elapsed().as_millis() as u64;
         let before = self.renders();
         let res = self
             .mem
@@ -385,6 +390,8 @@ impl Previews {
             pool,
             renders: self.renders.clone(),
             stats: self.stats.clone(),
+            purpose: "request",
+            wait_ms: 0,
         }
     }
 }
@@ -399,6 +406,10 @@ struct RenderJob {
     pool: Arc<Pool>,
     renders: Arc<AtomicU64>,
     stats: Arc<stats::Stats>,
+    /// `request` or `ahead` (`wirephoto status`).
+    purpose: &'static str,
+    /// How long it waited for a rendering slot (ms).
+    wait_ms: u64,
 }
 
 impl RenderJob {
@@ -410,16 +421,31 @@ impl RenderJob {
             }
             self.renders.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let done = render(&self.pool, &self.entry, &self.src, self.size)?;
-            let jpeg = done.bytes;
-            let label = kind_label(&self.entry);
-            let label = match done.made & !crate::decode::how::GPU_FAILED {
-                crate::decode::how::GPU => format!("{label} (GPU)"),
-                crate::decode::how::FFMPEG => format!("{label} (ffmpeg)"),
-                _ => label,
+            let kind = kind_label(&self.entry);
+            let key = |decoder: &str| stats::RenderKey {
+                purpose: self.purpose.to_string(),
+                kind: kind.clone(),
+                decoder: decoder.to_string(),
+                size: self.size,
             };
-            self.stats
-                .record(&label, started.elapsed().as_millis() as u64);
+            let done = match render(&self.pool, &self.entry, &self.src, self.size) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.stats.render_failed(key("-"));
+                    return Err(e);
+                }
+            };
+            let jpeg = done.bytes;
+            self.stats.rendered(
+                key(&decoder_label(&kind, done.made)),
+                stats::Took {
+                    total: self.wait_ms + started.elapsed().as_millis() as u64,
+                    wait: self.wait_ms,
+                    decode: done.decode_ms as u64,
+                    finish: done.finish_ms as u64,
+                },
+                done.made & crate::decode::how::GPU_FAILED != 0,
+            );
             tracing::debug!(
                 path = %self.entry.path,
                 size = self.size,
@@ -445,6 +471,22 @@ pub fn shrink(jpeg: &[u8], size: u32) -> anyhow::Result<Vec<u8>> {
         render::Encoder::Turbo
     };
     render::finish(render::decode_jpeg(jpeg, size)?, size, encoder)
+}
+
+/// What decoded a preview, as `wirephoto status` names it.
+fn decoder_label(kind: &str, made: u8) -> String {
+    use crate::decode::how;
+    match made & !how::GPU_FAILED {
+        how::GPU => "GPU".into(),
+        how::FFMPEG => "ffmpeg".into(),
+        _ => match kind {
+            "heic" | "avif" => "libheif",
+            "jpeg" | "raw" => "libjpeg-turbo",
+            "video" => "ffmpeg",
+            _ => "image",
+        }
+        .into(),
+    }
 }
 
 /// A source type as `wirephoto status` names it.

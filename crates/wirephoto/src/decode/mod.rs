@@ -4,8 +4,8 @@
 //!
 //! - request: `u32` length (little-endian) + a JSON [`Request`], with the source file's read-only descriptor
 //!   attached (`SCM_RIGHTS`) or, for bytes still in memory, followed by those bytes;
-//! - reply: `u8` status (0 ok, 1 failed) + `u8` how it was made ([`how`]) + `u32` length + the JPEG, the probe
-//!   JSON or the error message.
+//! - reply: `u8` status (0 ok, 1 failed) + `u8` how it was made ([`how`]) + `u32` length + `u32` ms decoding
+//!   + `u32` ms finishing (resize to encode) + the JPEG, the probe JSON or the error message.
 //!
 //! A worker that dies or hangs costs the request it was working on; the pool replaces it.
 
@@ -179,43 +179,57 @@ pub fn worker_main() -> anyhow::Result<()> {
         };
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, src)))
             .unwrap_or_else(|_| Err(anyhow!("decoder panicked")));
-        let (status, made, payload) = match out {
-            Ok((b, made)) => (0u8, made, b),
-            Err(e) => (1u8, how::NATIVE, format!("{e:#}").into_bytes()),
+        let (status, made, payload, times) = match out {
+            Ok((b, made, times)) => (0u8, made, b, times),
+            Err(e) => (1u8, how::NATIVE, format!("{e:#}").into_bytes(), (0, 0)),
         };
-        let mut head = [0u8; 6];
+        let mut head = [0u8; 14];
         head[0] = status;
         head[1] = made;
-        head[2..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        head[2..6].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        head[6..10].copy_from_slice(&times.0.to_le_bytes());
+        head[10..14].copy_from_slice(&times.1.to_le_bytes());
         sock.write_all(&head)?;
         sock.write_all(&payload)?;
     }
 }
 
-fn handle(req: Request, src: Source) -> anyhow::Result<(Vec<u8>, u8)> {
+/// One request: the reply, how it was made ([`how`]), and the milliseconds spent decoding (reading the
+/// file and decoding it, on the GPU too) and finishing (resize, colour, orientation, encode).
+fn handle(req: Request, src: Source) -> anyhow::Result<(Vec<u8>, u8, (u32, u32))> {
+    let ms = |t: std::time::Instant| t.elapsed().as_millis().min(u32::MAX as u128) as u32;
     match req.op {
         Op::Preview {
             format,
             size,
             cache,
         } => {
+            let t = std::time::Instant::now();
             let (decoded, made) = decode(&format, src, size, req.tools.as_ref(), &req.accel)?;
+            let decoding = ms(t);
             let encoder = if cache {
                 Encoder::Cache
             } else {
                 Encoder::Turbo
             };
-            Ok((render::finish(decoded, size, encoder)?, made))
+            let t = std::time::Instant::now();
+            let jpeg = render::finish(decoded, size, encoder)?;
+            Ok((jpeg, made, (decoding, ms(t))))
         }
         Op::Probe => {
             let tools = req.tools.as_ref().ok_or_else(|| anyhow!("no ffprobe"))?;
-            Ok((serde_json::to_vec(&video::probe(tools, src)?)?, how::NATIVE))
+            Ok((
+                serde_json::to_vec(&video::probe(tools, src)?)?,
+                how::NATIVE,
+                (0, 0),
+            ))
         }
         Op::GpuProbe { api, device } => {
             let tools = req.tools.as_ref().ok_or_else(|| anyhow!("no ffmpeg"))?;
             Ok((
                 serde_json::to_vec(&accel::probe(tools, api, device))?,
                 how::NATIVE,
+                (0, 0),
             ))
         }
     }

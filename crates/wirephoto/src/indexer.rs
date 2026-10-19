@@ -253,6 +253,11 @@ pub fn scan(app: &App, lib: &Library) -> anyhow::Result<()> {
         )?)
     })?;
     lib.status.set(None, 0, 0);
+    *lib.last_scan.write() = Some(crate::app::ScanInfo {
+        at: crate::util::now_secs() - started.elapsed().as_secs() as i64,
+        secs: started.elapsed().as_secs_f64(),
+        entries: total as u64,
+    });
     tracing::info!(
         "{}: scanned in {}, {} entries",
         lib.api_id,
@@ -434,6 +439,8 @@ pub fn begin_watch(app: &App, lib: &Library) -> Watching {
     let root = std::fs::canonicalize(&lib.fs.root).unwrap_or_else(|_| lib.fs.root.clone());
     let mut watched = HashSet::new();
     let unavailable = |e: &dyn std::fmt::Display| {
+        *lib.watch_note.write() =
+            format!("watching is unavailable ({e}): raise fs.inotify.max_user_watches to watch");
         tracing::warn!(
             library = %lib.api_id,
             "watching unavailable, polling every {} s instead: {e} (raise fs.inotify.max_user_watches to watch)",
@@ -441,6 +448,7 @@ pub fn begin_watch(app: &App, lib: &Library) -> Watching {
         )
     };
     let watcher = if lib.cfg.watch == crate::config::WatchMode::Poll {
+        *lib.watch_note.write() = "watch = \"poll\" in the config".into();
         None
     } else {
         match notify::recommended_watcher(move |ev| {
@@ -456,7 +464,11 @@ pub fn begin_watch(app: &App, lib: &Library) -> Watching {
                 let mut rels = indexed_folders(app, lib).unwrap_or_default();
                 rels.push(String::new());
                 match add_watches(&mut w, &root, &mut watched, rels) {
-                    Ok(_) => Some(w),
+                    Ok(_) => {
+                        *lib.watch_note.write() = "inotify, a watch per folder".into();
+                        lib.watched.store(watched.len() as u64, Ordering::Relaxed);
+                        Some(w)
+                    }
                     Err(e) => {
                         unavailable(&e);
                         None
@@ -464,7 +476,10 @@ pub fn begin_watch(app: &App, lib: &Library) -> Watching {
                 }
             }
             Ok(mut w) => match w.watch(&root, notify::RecursiveMode::Recursive) {
-                Ok(()) => Some(w),
+                Ok(()) => {
+                    *lib.watch_note.write() = "one watch on the whole tree".into();
+                    Some(w)
+                }
                 Err(e) => {
                     unavailable(&e);
                     None
@@ -500,6 +515,10 @@ pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
             && let Err(e) = watch_new_folders(&app, &lib, &mut watcher, &root, &mut watched).await
         {
             tracing::warn!(library = %lib.api_id, "watch limit reached, polling instead: {e} (raise fs.inotify.max_user_watches to watch)");
+            *lib.watch_note.write() = format!(
+                "the inotify watch limit was reached at {} folders ({e}): raise fs.inotify.max_user_watches",
+                watched.len()
+            );
             lib.live.store(false, Ordering::Relaxed);
             drop(watcher);
             return poll_forever(app, lib).await;
@@ -556,10 +575,15 @@ pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
                     watch_new_folders(&app, &lib, &mut watcher, &root, &mut watched).await
             {
                 tracing::warn!(library = %lib.api_id, "watch limit reached, polling instead: {e} (raise fs.inotify.max_user_watches to watch)");
+                *lib.watch_note.write() = format!(
+                    "the inotify watch limit was reached at {} folders ({e}): raise fs.inotify.max_user_watches",
+                    watched.len()
+                );
                 lib.live.store(false, Ordering::Relaxed);
                 drop(watcher);
                 return poll_forever(app, lib).await;
             }
+            lib.watched.store(watched.len() as u64, Ordering::Relaxed);
         }
     });
 }
@@ -1159,12 +1183,14 @@ pub async fn upkeep(app: Arc<App>) {
         tick += 1;
         let disk = app.previews.disk().clone();
         let evict = tick.is_multiple_of(10);
+        let a = app.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let _ = disk.flush();
             if evict
                 && let Ok(n) = disk.evict()
                 && n > 0
             {
+                crate::metrics::Metrics::add(&a.metrics.evicted_bytes, n);
                 tracing::info!(bytes = n, "evicted previews");
             }
         })
@@ -1330,6 +1356,7 @@ pub async fn report(app: Arc<App>) {
             }
         }
         let mut lines: Vec<(String, String)> = Vec::new();
+        let mut stages: HashMap<String, Stages> = HashMap::new();
         for lib in &app.libraries {
             let id = lib.api_id.clone();
             let scanning = lib
@@ -1346,6 +1373,15 @@ pub async fn report(app: Arc<App>) {
                 );
                 tracing::info!("{id}: {line}");
                 lines.push((id.clone(), line));
+                stages.insert(
+                    id.clone(),
+                    Stages {
+                        state: "scanning".into(),
+                        listed: s.done,
+                        list_rate: rate,
+                        ..Stages::default()
+                    },
+                );
                 last.insert(id, (prev, true, s.done));
                 continue;
             }
@@ -1382,6 +1418,45 @@ pub async fn report(app: Arc<App>) {
             let Ok(now) = counts else { continue };
             let previews_pending = if pregenerate { now.previews_pending } else { 0 };
             let busy = now.facts_pending + previews_pending + now.hashes_pending > 0;
+            let per_sec = |done: u64, before: u64| {
+                if was_busy {
+                    done.saturating_sub(before) as f64 / EVERY.as_secs_f64()
+                } else {
+                    0.0
+                }
+            };
+            stages.insert(
+                id.clone(),
+                Stages {
+                    state: if busy && paused(&app) {
+                        "paused"
+                    } else if busy {
+                        "working"
+                    } else {
+                        "up to date"
+                    }
+                    .into(),
+                    files: now.files,
+                    facts_pending: now.facts_pending,
+                    facts_rate: per_sec(
+                        now.files - now.facts_pending,
+                        prev.files - prev.facts_pending,
+                    ),
+                    previews_done: now.previews_done,
+                    previews_pending,
+                    previews_failed: now.deferred,
+                    not_previewable: now.not_previewable,
+                    previews_rate: per_sec(now.previews_done, prev.previews_done),
+                    hashes_pending: now.hashes_pending,
+                    hash_failed: now.hash_failed,
+                    hashes_rate: per_sec(
+                        now.files - now.hashes_pending,
+                        prev.files - prev.hashes_pending,
+                    ),
+                    pregenerate,
+                    ..Stages::default()
+                },
+            );
             // Speed from what got DONE since the last line, not from what is left: new files keep arriving
             // in a stage's queue while it works (reading files feeds previews), so "left" can stand still.
             let stage =
@@ -1481,7 +1556,8 @@ pub async fn report(app: Arc<App>) {
             }
             last.insert(id, (now, busy, 0));
         }
-        let mut snapshot = status_snapshot(&app, started, lines, &contents, &cache_sizes.1);
+        let mut snapshot =
+            status_snapshot(&app, started, lines, &stages, &contents, &cache_sizes.1);
         let time = std::mem::take(&mut snapshot.time);
         let Ok(unchanged) = serde_json::to_vec(&snapshot) else {
             continue;
@@ -1538,6 +1614,29 @@ pub struct Snapshot {
     pub uploads: UploadCounts,
     #[serde(default)]
     pub disk_watch: DiskWatch,
+    /// Previews made from originals, by purpose, type, decoder and size.
+    #[serde(default)]
+    pub renders: Vec<crate::preview::stats::RenderTimes>,
+    /// The last warnings and errors.
+    #[serde(default)]
+    pub problems: Vec<crate::problems::Problem>,
+    #[serde(default)]
+    pub ffmpeg: String,
+    #[serde(default)]
+    pub heic_route: String,
+    /// Live change feeds open (apps following along).
+    #[serde(default)]
+    pub change_feeds: i64,
+    #[serde(default)]
+    pub evicted_bytes: u64,
+    /// Background work is waiting for the API to go idle.
+    #[serde(default)]
+    pub yielding: bool,
+    #[serde(default)]
+    pub yield_seconds: u64,
+    /// Whether 640 px previews are made ahead of time (`[cache] pregenerate`).
+    #[serde(default)]
+    pub pregenerate: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1550,6 +1649,46 @@ pub struct LibraryStatus {
     pub progress: String,
     #[serde(default)]
     pub contents: Option<Contents>,
+    /// Each background stage's numbers.
+    #[serde(default)]
+    pub stages: Option<Stages>,
+    /// How changes on disk are noticed, and why; folders with a watch of their own.
+    #[serde(default)]
+    pub watch_note: String,
+    #[serde(default)]
+    pub watched_folders: u64,
+    #[serde(default)]
+    pub last_scan: Option<crate::app::ScanInfo>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Where a library's background work stands (`wirephoto status`). Rates are per second over the last 30 s.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Stages {
+    /// scanning, working, paused, up to date
+    pub state: String,
+    /// While scanning: entries listed so far.
+    pub listed: u64,
+    pub list_rate: f64,
+    /// Files (not folders, not in the trash).
+    pub files: u64,
+    /// Facts (size, orientation, capture time) still to read.
+    pub facts_pending: u64,
+    pub facts_rate: f64,
+    /// The cached 640 px preview: made, still to make, failed for a reason that may pass (retried after a
+    /// restart), and files that cannot have one (the decoder rejected them).
+    pub previews_done: u64,
+    pub previews_pending: u64,
+    pub previews_failed: u64,
+    pub not_previewable: u64,
+    pub previews_rate: f64,
+    /// Whether 640 px previews are made ahead of time (`[cache] pregenerate`).
+    pub pregenerate: bool,
+    pub hashes_pending: u64,
+    /// Could not be read (retried after a restart).
+    pub hash_failed: u64,
+    pub hashes_rate: f64,
 }
 
 /// What a library holds (`wirephoto status`).
@@ -1647,6 +1786,7 @@ fn status_snapshot(
     app: &App,
     started: i64,
     lines: Vec<(String, String)>,
+    stages: &HashMap<String, Stages>,
     contents: &HashMap<String, Contents>,
     cache_sizes: &[CacheSize],
 ) -> Snapshot {
@@ -1673,6 +1813,11 @@ fn status_snapshot(
                     .map(|(_, line)| line.clone())
                     .unwrap_or_default(),
                 contents: contents.get(&l.api_id).cloned(),
+                stages: stages.get(&l.api_id).cloned(),
+                watch_note: l.watch_note.read().clone(),
+                watched_folders: l.watched.load(Ordering::Relaxed),
+                last_scan: *l.last_scan.read(),
+                read_only: l.cfg.read_only,
             })
             .collect(),
         times: p.stats.times(),
@@ -1708,6 +1853,15 @@ fn status_snapshot(
                 bytes: Metrics::get(&m.upload_bytes),
             }
         },
+        renders: p.stats.renders(),
+        problems: crate::problems::recent(),
+        ffmpeg: app.ffmpeg.clone(),
+        heic_route: app.heic_route.clone(),
+        change_feeds: app.metrics.change_feeds.load(Ordering::Relaxed),
+        evicted_bytes: crate::metrics::Metrics::get(&app.metrics.evicted_bytes),
+        yielding: app.yielding.load(Ordering::Relaxed),
+        yield_seconds: app.config.background.yield_seconds,
+        pregenerate: app.config.cache.pregenerate,
         disk_watch: DiskWatch {
             events: crate::metrics::Metrics::get(&app.metrics.fs_events),
             folders_relisted: crate::metrics::Metrics::get(&app.metrics.folders_relisted),

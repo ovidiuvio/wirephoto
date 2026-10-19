@@ -23,6 +23,20 @@ pub struct Library {
     pub lock: Mutex<()>,
     pub status: IndexStatus,
     pub live: AtomicBool,
+    /// How changes on disk are noticed, and why (`wirephoto status`).
+    pub watch_note: RwLock<String>,
+    /// Folders with a watch of their own (Linux).
+    pub watched: AtomicU64,
+    /// The last full scan.
+    pub last_scan: RwLock<Option<ScanInfo>>,
+}
+
+/// A full scan of a library: when it started (unix seconds), how long it took, how many entries it listed.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanInfo {
+    pub at: i64,
+    pub secs: f64,
+    pub entries: u64,
 }
 
 /// Indexing progress, for `GET /v1/libraries`.
@@ -88,6 +102,9 @@ pub struct App {
     pub writes: AtomicU64,
     /// Requests, uploads and changes on disk since start (`wirephoto status`).
     pub metrics: crate::metrics::Metrics,
+    /// `ffmpeg -version`'s first line, or "not found"; how HEIC is decoded (`wirephoto status`).
+    pub ffmpeg: String,
+    pub heic_route: String,
 }
 
 impl App {

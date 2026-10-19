@@ -26,6 +26,10 @@ pub struct Metrics {
     pub folders_relisted: AtomicU64,
     /// When the index last changed for something done on disk, not through the API (unix seconds).
     pub last_disk_change: AtomicI64,
+    /// Live change feeds open now (`GET /v1/changes` as a stream: an app following along).
+    pub change_feeds: AtomicI64,
+    /// Bytes the preview cache evicted to stay within its budget.
+    pub evicted_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -33,7 +37,10 @@ struct Counts {
     count: u64,
     client_errors: u64,
     server_errors: u64,
+    /// `504 not-cached`: asked only if cached, and it was not. Expected, not an error.
+    not_cached: u64,
     bytes: u64,
+    bytes_in: u64,
 }
 
 /// One kind of request, as `wirephoto status` prints it.
@@ -43,7 +50,12 @@ pub struct RequestKind {
     pub count: u64,
     pub client_errors: u64,
     pub server_errors: u64,
+    #[serde(default)]
+    pub not_cached: u64,
+    /// Bytes sent, and received (request bodies).
     pub bytes: u64,
+    #[serde(default)]
+    pub bytes_in: u64,
     pub p50_ms: u64,
     pub p95_ms: u64,
     pub max_ms: u64,
@@ -58,7 +70,15 @@ pub fn kind_of(method: &str, path: &str) -> &'static str {
         (_, ["v1"]) | (_, ["v1", "libraries", ..]) => "server",
         ("GET", ["v1", "entries"]) => "listings",
         ("GET", ["v1", "entries", _]) => "entries",
-        ("GET", ["v1", "entries", _, "preview", _]) => "previews",
+        ("GET", ["v1", "entries", _, "preview", file]) => match *file {
+            "160.jpg" => "previews 160",
+            "320.jpg" => "previews 320",
+            "480.jpg" => "previews 480",
+            "640.jpg" => "previews 640",
+            "1280.jpg" => "previews 1280",
+            "2560.jpg" => "previews 2560",
+            _ => "previews",
+        },
         ("POST", ["v1", "previews"]) => "batch previews",
         ("GET" | "HEAD", ["v1", "entries", _, "content"]) => "originals",
         ("PUT", ["v1", "entries", ..]) | (_, ["v1", "tus", ..]) => "uploads",
@@ -71,18 +91,27 @@ pub fn kind_of(method: &str, path: &str) -> &'static str {
 }
 
 impl Metrics {
-    /// A request answered: its kind, status, size (when known) and time to the response.
-    pub fn request(&self, kind: &'static str, status: u16, bytes: Option<u64>, ms: u64) {
+    /// A request answered: its kind, status, sizes sent and received (when known) and time to the response.
+    pub fn request(
+        &self,
+        kind: &'static str,
+        status: u16,
+        bytes: Option<u64>,
+        bytes_in: Option<u64>,
+        ms: u64,
+    ) {
         {
             let mut all = self.requests.lock();
             let c = all.entry(kind).or_default();
             c.count += 1;
             match status {
+                504 => c.not_cached += 1,
                 400..=499 => c.client_errors += 1,
                 500..=599 => c.server_errors += 1,
                 _ => {}
             }
             c.bytes += bytes.unwrap_or(0);
+            c.bytes_in += bytes_in.unwrap_or(0);
         }
         self.times.record(kind, ms);
     }
@@ -100,7 +129,9 @@ impl Metrics {
                     count: c.count,
                     client_errors: c.client_errors,
                     server_errors: c.server_errors,
+                    not_cached: c.not_cached,
                     bytes: c.bytes,
+                    bytes_in: c.bytes_in,
                     p50_ms: t.map_or(0, |t| t.p50_ms),
                     p95_ms: t.map_or(0, |t| t.p95_ms),
                     max_ms: t.map_or(0, |t| t.max_ms),
@@ -135,7 +166,7 @@ mod tests {
         assert_eq!(kind_of("GET", "/v1/entries/ent_1"), "entries");
         assert_eq!(
             kind_of("GET", "/v1/entries/ent_1/preview/640.jpg?v=1&sig=…"),
-            "previews"
+            "previews 640"
         );
         assert_eq!(
             kind_of("GET", "/v1/entries/ent_1/content?sig=…"),
@@ -149,9 +180,19 @@ mod tests {
         assert_eq!(kind_of("PATCH", "/v1/entries/ent_1"), "changes made");
         assert_eq!(kind_of("GET", "/v1/changes"), "change feed");
         let m = Metrics::default();
-        m.request("previews", 200, Some(30_000), 2);
-        m.request("previews", 404, Some(100), 1);
+        m.request("previews 320", 200, Some(30_000), None, 2);
+        m.request("previews 320", 404, Some(100), None, 1);
+        m.request("previews 320", 504, Some(100), None, 1);
         let r = m.requests();
-        assert_eq!((r[0].count, r[0].client_errors, r[0].bytes), (2, 1, 30_100));
+        assert_eq!(
+            (
+                r[0].count,
+                r[0].client_errors,
+                r[0].server_errors,
+                r[0].not_cached,
+                r[0].bytes
+            ),
+            (3, 1, 0, 1, 30_200)
+        );
     }
 }

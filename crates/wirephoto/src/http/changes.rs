@@ -130,7 +130,22 @@ pub async fn get_changes(
     }
     let mut seq_rx = app.seq.subscribe();
     let library = q.library.clone();
+    // Counted while open (`wirephoto status`): the guard leaves with the stream.
+    struct Open(Arc<App>);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0
+                .metrics
+                .change_feeds
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    app.metrics
+        .change_feeds
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let open = Open(app.clone());
     let stream = async_stream::stream! {
+        let _open = open;
         let mut since = since;
         loop {
             let (a, k, lib) = (app.clone(), key.clone(), library.clone());

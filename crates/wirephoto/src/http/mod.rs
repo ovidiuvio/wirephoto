@@ -192,6 +192,11 @@ async fn access_log(
     req.extensions_mut().insert(info.clone());
     let method = req.method().clone();
     let path = redacted(req.uri());
+    let bytes_in = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     // Requests come first: background work slows down while the API is in use. Health checks and the live
     // changes stream (an app keeps it open) do not count.
     let counts = !(path == "/healthz" || path.starts_with("/v1/changes"));
@@ -215,6 +220,7 @@ async fn access_log(
         crate::metrics::kind_of(method.as_str(), &path),
         status,
         bytes,
+        bytes_in,
         ms,
     );
     if app.config.log.access {
@@ -341,5 +347,6 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), access_log))
         .layer(cors(app))
         .layer(middleware::from_fn(crate::tus::discovery))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Failures are in the access log; tower-http would log every 504 not-cached as an error.
+        .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(()))
 }

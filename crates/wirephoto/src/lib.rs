@@ -13,7 +13,9 @@ pub mod kind;
 pub mod media;
 pub mod metrics;
 pub mod preview;
+pub mod problems;
 pub mod resources;
+pub mod status;
 pub mod tus;
 pub mod util;
 pub mod write;
@@ -47,6 +49,8 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
         config.cache.max_size,
         preview::CACHED_SIZE,
     )?;
+    let ffmpeg: String;
+    let mut heic_route = String::new();
     let workers = config.decode.workers;
     let memory = config.cache.memory;
     let pool = {
@@ -59,6 +63,20 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
             None => std::env::current_exe().context("locating the wirephoto binary")?,
         };
         let tools = decode::Tools::find(config.decode.ffmpeg.as_deref());
+        ffmpeg = match &tools {
+            Some(t) => std::process::Command::new(&t.ffmpeg)
+                .arg("-version")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| {
+                    s.lines()
+                        .next()
+                        .map(|l| l.split(" Copyright").next().unwrap_or(l).trim().to_string())
+                })
+                .unwrap_or_else(|| t.ffmpeg.display().to_string()),
+            None => "not found".into(),
+        };
         match &tools {
             Some(t) => tracing::info!(ffmpeg = %t.ffmpeg.display(), "video posters on"),
             None => tracing::warn!("ffmpeg/ffprobe not found: videos get no posters or durations"),
@@ -72,10 +90,21 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
                     tracing::info!(
                         "HEIC through libheif: this ffmpeg is older than 7.0 (no tile grids)"
                     );
+                    heic_route =
+                        "libheif (this ffmpeg is older than 7.0, which reads tile grids)".into();
                     false
                 }
-                None => false,
+                None => {
+                    heic_route = "libheif (no ffmpeg)".into();
+                    false
+                }
             };
+        if heic_ffmpeg {
+            heic_route =
+                "ffmpeg (libheif for files with transparency, and what ffmpeg cannot read)".into();
+        } else if config.decode.heic == config::HeicMode::Libheif {
+            heic_route = "libheif ([decode] heic = \"libheif\")".into();
+        }
         let gpu = Arc::new(decode::GpuState::new(
             heic_ffmpeg,
             candidate.is_some(),
@@ -135,6 +164,9 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
             lock: tokio::sync::Mutex::new(()),
             status: IndexStatus::default(),
             live: false.into(),
+            watch_note: RwLock::new(String::new()),
+            watched: Default::default(),
+            last_scan: RwLock::new(None),
         }));
     }
     let seq = db.read(|c| Ok(db::current_seq(c)?))?;
@@ -155,6 +187,8 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
         yielding: std::sync::atomic::AtomicBool::new(false),
         writes: std::sync::atomic::AtomicU64::new(0),
         metrics: Default::default(),
+        ffmpeg,
+        heic_route,
     });
     // The root IDs of libraries indexed before, so they are known before the scan finishes.
     for lib in &app.libraries {

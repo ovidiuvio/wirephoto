@@ -24,6 +24,9 @@ pub enum Input {
 pub struct Done {
     pub bytes: Vec<u8>,
     pub made: u8,
+    /// In the worker: reading and decoding the source, and resizing to encoding the JPEG (ms).
+    pub decode_ms: u32,
+    pub finish_ms: u32,
 }
 
 /// GPU failures in a row after which the GPU is left alone until the next start.
@@ -350,12 +353,14 @@ fn exchange(
             w.sock.write_all(b)?;
         }
     }
-    let mut status = [0u8; 6];
+    let mut status = [0u8; 14];
     w.sock
         .read_exact(&mut status)
         .map_err(|e| anyhow!("no reply: {e}"))?;
     let made = status[1];
-    let len = u32::from_le_bytes(status[2..].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(status[2..6].try_into().unwrap()) as usize;
+    let decode_ms = u32::from_le_bytes(status[6..10].try_into().unwrap());
+    let finish_ms = u32::from_le_bytes(status[10..14].try_into().unwrap());
     if len > MAX_MESSAGE {
         bail!("reply too large");
     }
@@ -365,6 +370,8 @@ fn exchange(
         0 => Ok(Done {
             bytes: payload,
             made,
+            decode_ms,
+            finish_ms,
         }),
         _ => Err(DecodeFailed(String::from_utf8_lossy(&payload).into_owned()).into()),
     })
