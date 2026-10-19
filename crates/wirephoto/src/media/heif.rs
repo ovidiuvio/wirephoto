@@ -89,9 +89,12 @@ pub fn transforms(file_head: &[u8]) -> Option<Vec<Transform>> {
                 if item != primary || index == 0 {
                     continue;
                 }
-                match props.get(index - 1) {
-                    Some((b"irot", p)) => out.push(Transform::Rotate(p.first()? & 3)),
-                    Some((b"imir", p)) => out.push(Transform::Mirror(p.first()? & 1 == 1)),
+                let Some((typ, p)) = props.get(index - 1) else {
+                    continue;
+                };
+                match typ {
+                    b"irot" => out.push(Transform::Rotate(p.first()? & 3)),
+                    b"imir" => out.push(Transform::Mirror(p.first()? & 1 == 1)),
                     _ => {}
                 }
             }
