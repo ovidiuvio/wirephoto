@@ -131,6 +131,7 @@ fn cors(app: Arc<App>) -> CorsLayer {
             header::IF_NONE_MATCH,
             header::IF_RANGE,
             header::RANGE,
+            header::CONTENT_RANGE,
             header::ACCEPT,
             h("content-digest"),
             h("last-event-id"),

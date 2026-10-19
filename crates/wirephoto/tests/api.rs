@@ -247,6 +247,49 @@ async fn cors_allows_key_origins_only() {
     assert_eq!(r.header("access-control-max-age").as_deref(), Some("7200"));
     let r = t.send(pre("https://evil.example")).await;
     assert!(r.header("access-control-allow-origin").is_none());
+    // Every request of an upload session passes a browser's preflight.
+    for (method, uri, headers) in [
+        ("POST", "/v1/uploads", "authorization,content-type"),
+        (
+            "PUT",
+            "/v1/uploads/upl_x",
+            "authorization,content-range,content-digest",
+        ),
+        ("GET", "/v1/uploads/upl_x", "authorization"),
+        (
+            "POST",
+            "/v1/uploads/upl_x/complete",
+            "authorization,content-digest",
+        ),
+        ("DELETE", "/v1/uploads/upl_x", "authorization"),
+        (
+            "PUT",
+            "/v1/entries/ent_x/children/a.jpg",
+            "authorization,content-type,content-digest,if-none-match",
+        ),
+    ] {
+        let r = t
+            .send(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://lith.example.com")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, headers)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let allowed = r.header("access-control-allow-headers").unwrap_or_default();
+        for h in headers.split(',') {
+            assert!(
+                allowed.split(',').any(|a| a.trim() == h),
+                "{method} {uri}: {h} not in {allowed}"
+            );
+        }
+        let methods = r.header("access-control-allow-methods").unwrap_or_default();
+        assert!(methods.contains(method), "{method} {uri}: {methods}");
+    }
     // A cross-origin isolated page (COEP require-corp) may embed previews by their signed URLs.
     let r = t.get("/healthz").await;
     assert_eq!(
