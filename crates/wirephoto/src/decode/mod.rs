@@ -285,7 +285,7 @@ fn decode(
             let heic = matches!(src, Source::File(_)) && !is_avif(&bytes) && tools.is_some();
             if let (true, Some(meta)) = (heic, render::heif_meta(&bytes).filter(|m| !m.alpha)) {
                 if let Some((g, t)) = gpu.filter(|(g, _)| g.hevc || g.hevc10) {
-                    match accel::heic(t, Some(g), &src, size, meta.icc.clone()) {
+                    match accel::heic(t, Some(g), &src, size, meta.icc.clone(), meta.orientation) {
                         Ok(Some(d)) => return Ok((d, how::GPU)),
                         Ok(None) => {} // a format this GPU does not decode
                         Err(e) => gpu_failed(e),
@@ -294,7 +294,7 @@ fn decode(
                 if accel.heic_ffmpeg
                     && let Some(t) = tools
                 {
-                    match accel::heic(t, None, &src, size, meta.icc) {
+                    match accel::heic(t, None, &src, size, meta.icc, meta.orientation) {
                         Ok(Some(d)) => return Ok((d, how::FFMPEG | failed)),
                         Ok(None) => {}
                         Err(e) => eprintln!(

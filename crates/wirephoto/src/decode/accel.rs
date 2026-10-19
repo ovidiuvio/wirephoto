@@ -186,8 +186,6 @@ pub struct Layout {
     pub height: u32,
     /// The tiles' pixel format ("yuvj420p", "yuv420p10le", ...).
     pub pix_fmt: String,
-    /// The EXIF orientation the container's rotation and mirroring amount to.
-    pub orientation: u8,
 }
 
 impl Layout {
@@ -242,7 +240,6 @@ pub fn parse_layout(v: &serde_json::Value) -> anyhow::Result<Layout> {
             width: c["width"].as_u64().context("grid width")? as u32,
             height: c["height"].as_u64().context("grid height")? as u32,
             pix_fmt: s["pix_fmt"].as_str().unwrap_or("").to_string(),
-            orientation: orientation_of(c["side_data_list"].as_array()),
             tiles,
         });
     }
@@ -257,42 +254,7 @@ pub fn parse_layout(v: &serde_json::Value) -> anyhow::Result<Layout> {
         width: s["width"].as_u64().context("width")? as u32,
         height: s["height"].as_u64().context("height")? as u32,
         pix_fmt: s["pix_fmt"].as_str().unwrap_or("").to_string(),
-        orientation: orientation_of(s["side_data_list"].as_array()),
     })
-}
-
-/// A display matrix (ffprobe's text form: rows of `a b u`, fixed point) as an EXIF orientation. HEIF's rotation
-/// (`irot`) and mirroring (`imir`) arrive as one.
-fn orientation_of(side_data: Option<&Vec<serde_json::Value>>) -> u8 {
-    let Some(m) = side_data
-        .into_iter()
-        .flatten()
-        .find(|d| d["side_data_type"] == "Display Matrix")
-        .and_then(|d| d["displaymatrix"].as_str())
-    else {
-        return 1;
-    };
-    // "00000000: a b u 00000001: c d v 00000002: x y w"
-    let n: Vec<i64> = m
-        .split_whitespace()
-        .filter(|t| !t.ends_with(':'))
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    if n.len() < 5 {
-        return 1;
-    }
-    let sign = |v: i64| v.signum();
-    match (sign(n[0]), sign(n[1]), sign(n[3]), sign(n[4])) {
-        (1, 0, 0, 1) => 1,
-        (-1, 0, 0, 1) => 2,
-        (-1, 0, 0, -1) => 3,
-        (1, 0, 0, -1) => 4,
-        (0, 1, 1, 0) => 5,
-        (0, 1, -1, 0) => 6,
-        (0, -1, -1, 0) => 7,
-        (0, -1, 1, 0) => 8,
-        _ => 1,
-    }
 }
 
 /// The filter graph: tiles downloaded from the GPU (when on it), placed, cropped to the image, scaled to
@@ -367,6 +329,7 @@ pub(crate) fn heic(
     src: &Source,
     target: u32,
     icc: Option<Vec<u8>>,
+    orientation: u8,
 ) -> anyhow::Result<Option<Decoded>> {
     let input = Input::of(src)?;
     let l = layout(tools, &input)?;
@@ -380,7 +343,7 @@ pub(crate) fn heic(
     Ok(Some(Decoded {
         img,
         icc,
-        orientation: l.orientation,
+        orientation,
     }))
 }
 
@@ -427,29 +390,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_matrices_to_orientations() {
-        let m = |a: i64, b: i64, c: i64, d: i64| {
-            let dm = format!("00000000: {a} {b} 0\n00000001: {c} {d} 0\n00000002: 0 0 1073741824");
-            vec![serde_json::json!({"side_data_type": "Display Matrix", "displaymatrix": dm})]
-        };
-        // As ffprobe reports what Apple's encoder writes for EXIF orientations 2..8.
-        let u = 65536;
-        let cases = [
-            (2, m(-u, 0, 0, u)),
-            (3, m(-u, 0, 0, -u)),
-            (4, m(u, 0, 0, -u)),
-            (5, m(0, u, u, 0)),
-            (6, m(0, u, -u, 0)),
-            (7, m(0, -u, -u, 0)),
-            (8, m(0, -u, u, 0)),
-        ];
-        for (want, sd) in cases {
-            assert_eq!(orientation_of(Some(&sd)), want);
-        }
-        assert_eq!(orientation_of(None), 1);
-    }
-
-    #[test]
     fn grids_and_single_pictures() {
         let v = serde_json::json!({
             "streams": [
@@ -466,10 +406,7 @@ mod tests {
             }]}]
         });
         let l = parse_layout(&v).unwrap();
-        assert_eq!(
-            (l.width, l.height, l.tiles.len(), l.orientation),
-            (1000, 500, 2, 1)
-        );
+        assert_eq!((l.width, l.height, l.tiles.len()), (1000, 500, 2));
         assert!(l.gpu_friendly() && !l.ten_bit());
         assert_eq!(
             graph(&l, true, (640, 320)),
@@ -511,7 +448,11 @@ mod tests {
             };
             let want = pixels(render::decode_heif(&bytes).unwrap());
             let src = Source::File(std::fs::File::open(&path).unwrap());
-            let got = pixels(heic(&tools, None, &src, 320, meta.icc).unwrap().unwrap());
+            let got = pixels(
+                heic(&tools, None, &src, 320, meta.icc, meta.orientation)
+                    .unwrap()
+                    .unwrap(),
+            );
             assert_eq!((got.w, got.h), (want.w, want.h), "{name}");
             let diff: u64 = got
                 .px

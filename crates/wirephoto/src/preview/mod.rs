@@ -347,6 +347,19 @@ impl Previews {
         Some(b)
     }
 
+    /// Forgets every preview of `entry`, in memory and on disk, to make them again.
+    pub async fn forget(&self, entry: &EntryRow) -> anyhow::Result<()> {
+        let mut keys: Vec<String> = SIZES.iter().map(|&s| entry_key(entry, s)).collect();
+        if let Some(h) = entry.sha256.as_deref().filter(|h| h.len() == 32) {
+            keys.extend(SIZES.iter().map(|&s| content_key(h, s)));
+        }
+        for k in &keys {
+            self.mem.invalidate(k).await;
+        }
+        let disk = self.disk.clone();
+        tokio::task::spawn_blocking(move || disk.remove(&keys)).await?
+    }
+
     /// A file was just hashed: its entry-keyed previews move to the content key, or are dropped where a copy's
     /// are there already (blocking).
     pub fn adopt_hash(&self, before: &EntryRow, hash: &[u8; 32]) -> anyhow::Result<()> {

@@ -2306,3 +2306,56 @@ async fn tus_creation_with_upload_dedup_names_keys_and_expiry() {
         .await;
     assert_eq!(r.status, 404);
 }
+
+/// HEIC previews made before the rotation was read from the file are made again, under new URLs, once.
+#[cfg(feature = "heic")]
+#[tokio::test]
+async fn rotated_heic_previews_are_made_again_under_new_urls() {
+    let t = setup().await;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heic");
+    std::fs::copy(
+        fixtures.join("orientation-6.heic"),
+        t.lib.join("2026/turned.heic"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures.join("orientation-1.heic"),
+        t.lib.join("2026/straight.heic"),
+    )
+    .unwrap();
+    rescan(&t).await;
+    let before = t.entry_at("/2026/turned.heic").await;
+    let old_url = before["urls"]["preview"]
+        .as_str()
+        .unwrap()
+        .replace("{size}", "640");
+    let straight = t.entry_at("/2026/straight.heic").await;
+
+    wirephoto::indexer::redo_rotated_heic(t.app.clone()).await;
+    wirephoto::indexer::settle(&t.app).await.unwrap();
+    let after = t.entry_at("/2026/turned.heic").await;
+    let new_url = after["urls"]["preview"]
+        .as_str()
+        .unwrap()
+        .replace("{size}", "640");
+    assert_ne!(old_url, new_url, "a new URL, so browsers fetch it again");
+    assert!(new_url.contains(&format!("v={}.1", after["etag"].as_str().unwrap())));
+    assert_eq!(
+        t.entry_at("/2026/straight.heic").await["urls"]["preview"],
+        straight["urls"]["preview"],
+        "an unrotated one keeps its URL"
+    );
+    // The old URL leads to the new one; the preview is upright (portrait).
+    let r = t.get(&old_url).await;
+    assert_eq!(r.status, 307);
+    let r = t.get(&new_url).await;
+    assert_eq!(r.status, 200);
+    let (w, h) = decode_size(&r.body);
+    assert!(h > w, "portrait: {w}x{h}");
+    // Once only.
+    wirephoto::indexer::redo_rotated_heic(t.app.clone()).await;
+    assert_eq!(
+        t.entry_at("/2026/turned.heic").await["urls"]["preview"],
+        after["urls"]["preview"]
+    );
+}

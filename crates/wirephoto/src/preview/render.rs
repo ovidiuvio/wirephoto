@@ -198,10 +198,20 @@ pub fn decode_heif(bytes: &[u8]) -> anyhow::Result<Decoded> {
     })
 }
 
+/// The EXIF orientation of a HEIF's primary image (1 when it has no rotation or mirroring).
+pub fn heif_orientation(bytes: &[u8]) -> u8 {
+    crate::media::heif::transforms(bytes)
+        .map(|t| crate::media::heif::orientation(&t))
+        .unwrap_or(1)
+}
+
 /// What decoding a HEIF elsewhere needs from libheif: whether it has transparency, and its ICC profile.
 pub struct HeifMeta {
     pub alpha: bool,
     pub icc: Option<Vec<u8>>,
+    /// The EXIF orientation of the container's rotation and mirroring, read from its boxes: a decoder that
+    /// does not apply them (ffmpeg before 8) leaves the picture as stored.
+    pub orientation: u8,
 }
 
 /// The primary image's [`HeifMeta`] (the container is parsed, nothing decoded).
@@ -212,14 +222,16 @@ pub fn heif_meta(bytes: &[u8]) -> Option<HeifMeta> {
     Some(HeifMeta {
         alpha: handle.has_alpha_channel(),
         icc: handle.color_profile_raw().map(|p| p.data),
+        orientation: heif_orientation(bytes),
     })
 }
 
 #[cfg(not(feature = "heic"))]
-pub fn heif_meta(_: &[u8]) -> Option<HeifMeta> {
+pub fn heif_meta(bytes: &[u8]) -> Option<HeifMeta> {
     Some(HeifMeta {
         alpha: false,
         icc: None,
+        orientation: heif_orientation(bytes),
     })
 }
 

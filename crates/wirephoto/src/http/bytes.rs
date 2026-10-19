@@ -157,7 +157,7 @@ pub async fn get_preview(
     if !row.previewable {
         return Err(ApiError::unsupported_media());
     }
-    let etag = row.etag();
+    let etag = row.preview_version();
     if let Some(v) = &q.v
         && *v != etag
     {

@@ -119,6 +119,28 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Removes these previews (those there are).
+    pub fn remove(&self, keys: &[String]) -> anyhow::Result<()> {
+        let mut w = self.db.begin_write()?;
+        w.set_durability(Durability::None)?;
+        let mut freed = 0u64;
+        {
+            let mut meta = w.open_table(META)?;
+            let mut previews = w.open_table(PREVIEWS)?;
+            for k in keys {
+                if let Some(m) = meta.remove(k.as_str())? {
+                    freed += m.value().0;
+                }
+                previews.remove(k.as_str())?;
+            }
+        }
+        w.commit()?;
+        self.total.fetch_sub(freed, Ordering::Relaxed);
+        self.dirty.store(true, Ordering::Relaxed);
+        self.changes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Renames keys `(from, to)`; where `to` exists already (a copy's preview), `from` is just removed.
     pub fn rekey(&self, moves: &[(String, String)]) -> anyhow::Result<()> {
         let mut w = self.db.begin_write()?;

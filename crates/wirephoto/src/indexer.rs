@@ -933,6 +933,7 @@ pub async fn background(app: Arc<App>) {
     if let Err(e) = retry_failed_previews(&app) {
         tracing::warn!("resetting failed previews: {e:#}");
     }
+    tokio::spawn(redo_rotated_heic(app.clone()));
     tokio::spawn(facts_loop(app.clone()));
     tokio::spawn(hash_loop(app.clone()));
     let mut changes = app.seq.subscribe();
@@ -1013,6 +1014,66 @@ fn count_progress(app: &App) -> bool {
         }
     }
     all
+}
+
+/// Once per index: HEIC previews made through ffmpeg 7, which does not apply a HEIF's rotation and mirroring,
+/// came out as stored, sideways or flipped. Every HEIC that has either gets its previews made again, under new
+/// URLs (browsers keep a preview URL's picture for good), and a change saying so.
+pub async fn redo_rotated_heic(app: Arc<App>) {
+    const DONE: &str = "heic_rotation_v1";
+    if app.db.meta_get(DONE).ok().flatten().is_some() {
+        return;
+    }
+    let a = app.clone();
+    let found = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<EntryRow>> {
+        let rows: Vec<EntryRow> = a.db.read(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {} FROM {} WHERE e.mime IN ('image/heic', 'image/heif') AND e.trashed_at IS NULL AND e.missing = 0",
+                db::ENTRY_COLS,
+                db::ENTRY_FROM
+            ))?;
+            let rows = st.query_map([], EntryRow::from_row)?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        // The boxes that say so are at the start of the file.
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                a.library(&r.library)
+                    .and_then(|l| l.fs.read_head(&r.path, 256 << 10).ok())
+                    .is_some_and(|head| crate::preview::render::heif_orientation(&head) != 1)
+            })
+            .collect())
+    })
+    .await;
+    let rows = match found {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return tracing::warn!("looking for rotated HEICs: {e:#}"),
+        Err(e) => return tracing::warn!("looking for rotated HEICs: {e}"),
+    };
+    for row in &rows {
+        if let Err(e) = app.previews.forget(row).await {
+            tracing::debug!(entry = %row.id, "forgetting previews: {e:#}");
+        }
+    }
+    let done = app.write(|t| {
+        for row in &rows {
+            t.execute(
+                "UPDATE entries SET preview_done = 0, preview_gen = preview_gen + 1 WHERE rowid = ?",
+                [row.rowid],
+            )?;
+            db::record_change(t, ChangeType::Updated, &row.id, &row.library, row.parent_id.as_deref())?;
+        }
+        Ok(())
+    });
+    match done.and_then(|()| app.db.meta_set(DONE, b"1")) {
+        Ok(()) if !rows.is_empty() => tracing::info!(
+            photos = rows.len(),
+            "making the previews of rotated HEICs again (they came out unrotated)"
+        ),
+        Ok(()) => {}
+        Err(e) => tracing::warn!("redoing rotated HEIC previews: {e:#}"),
+    }
 }
 
 /// How often paused background work looks whether it may resume.

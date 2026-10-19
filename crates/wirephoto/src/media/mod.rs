@@ -1,6 +1,7 @@
 //! What the server reads from a photo to serve it (design.md, Scope): kind and MIME type from the content, the
 //! displayed size, the EXIF orientation, the capture time, and whether a preview can be made.
 
+pub mod heif;
 pub mod jpeg;
 pub mod rawjpeg;
 pub mod tiff;

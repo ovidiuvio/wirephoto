@@ -50,7 +50,7 @@ pub fn to_api(
                 format!(
                     "/v1/entries/{}/preview/{{size}}.jpg?v={}&sig={sig}",
                     row.id,
-                    row.etag()
+                    row.preview_version()
                 )
             }),
         }
@@ -283,7 +283,7 @@ fn list(app: &Arc<App>, key: &KeyRow, q: ListQuery) -> ApiResult<Page<Entry>> {
             let mut st = c.prepare(&sql)?;
             let mut rows: Vec<(EntryRow, Value)> = st
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-                    Ok((EntryRow::from_row(r)?, r.get::<_, Value>(26)?))
+                    Ok((EntryRow::from_row(r)?, r.get::<_, Value>(27)?))
                 })?
                 .collect::<Result<_, _>>()?;
             if lookup {

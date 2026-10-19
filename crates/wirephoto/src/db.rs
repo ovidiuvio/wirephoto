@@ -139,7 +139,12 @@ CREATE INDEX IF NOT EXISTS entries_preview_todo ON entries(dev, ino)
 "#;
 
 /// Columns added to the schema after indexes had been created with it: added to an older index on open.
-const ADDED_COLUMNS: &[(&str, &str)] = &[("entries", "hash_deferred INTEGER NOT NULL DEFAULT 0")];
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("entries", "hash_deferred INTEGER NOT NULL DEFAULT 0"),
+    // Bumped when a file's previews are made again for the same bytes: part of their URLs (`v`), which
+    // browsers cache for good.
+    ("entries", "preview_gen INTEGER NOT NULL DEFAULT 0"),
+];
 
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Db> {
@@ -236,11 +241,12 @@ pub struct EntryRow {
     pub trash_root: Option<i64>,
     pub orig_parent: Option<i64>,
     pub orig_name: Option<String>,
+    pub preview_gen: i64,
 }
 
 pub const ENTRY_COLS: &str = "e.rowid, e.id, e.library, e.parent, p.id, e.name, e.path, e.kind, e.mime, e.size, \
     e.mtime_ns, e.dev, e.ino, e.sha256, e.width, e.height, e.orientation, e.taken, e.sort_taken, e.duration, \
-    e.media_state, e.previewable, e.trashed_at, e.trash_root, e.orig_parent, e.orig_name";
+    e.media_state, e.previewable, e.trashed_at, e.trash_root, e.orig_parent, e.orig_name, e.preview_gen";
 
 pub const ENTRY_FROM: &str = "entries e LEFT JOIN entries p ON p.rowid = e.parent";
 
@@ -273,6 +279,7 @@ impl EntryRow {
             trash_root: r.get(23)?,
             orig_parent: r.get(24)?,
             orig_name: r.get(25)?,
+            preview_gen: r.get(26)?,
         })
     }
 
@@ -281,6 +288,14 @@ impl EntryRow {
             crate::util::folder_etag(&self.library, &self.path)
         } else {
             crate::util::file_etag(self.size, self.mtime_ns, self.ino)
+        }
+    }
+
+    /// The version of the file's previews (their URLs' `v`): its etag, and how many times they were made again.
+    pub fn preview_version(&self) -> String {
+        match self.preview_gen {
+            0 => self.etag(),
+            n => format!("{}.{n}", self.etag()),
         }
     }
 
