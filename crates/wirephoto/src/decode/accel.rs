@@ -333,8 +333,12 @@ pub(crate) fn heic(
 ) -> anyhow::Result<Option<Decoded>> {
     let input = Input::of(src)?;
     let l = layout(tools, &input)?;
+    // A grid's tiles are separate streams to ffmpeg, each with its own decoder and, on the GPU, its own
+    // session: setting those up costs far more than the decoding (measured on a Celeron NAS: ~8 s for a
+    // grid, against ~2 s on the CPU). Grids are decoded on the CPU.
     if let Some(g) = gpu
-        && !(l.gpu_friendly() && if l.ten_bit() { g.hevc10 } else { g.hevc })
+        && (l.tiles.len() > 1
+            || !(l.gpu_friendly() && if l.ten_bit() { g.hevc10 } else { g.hevc }))
     {
         return Ok(None);
     }
