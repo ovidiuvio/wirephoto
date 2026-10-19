@@ -166,9 +166,10 @@ gpu = "on"
 INFO wirephoto: decoding on the GPU: VA-API /dev/dri/renderD128: HEVC, HEVC 10-bit, JPEG
 ```
 
-and `wirephoto status` has a `GPU:` line saying the same, or why the GPU is not used. Its timing table shows the
-GPU's renderings separately (`heic (GPU)`, `jpeg (GPU)`); setting `gpu = "off"` for a while shows the CPU's
-(`heic (ffmpeg)`) to compare.
+and `wirephoto status` has a `GPU` line saying the same, or why the GPU is not used, and how many images it decoded
+and failed on. Its "Previews made from originals" table has a row per decoder (`GPU`, `ffmpeg` on the CPU,
+`libheif`, ...), with where the time went (`decoding` is the part the GPU does); setting `gpu = "off"` for a while
+shows the CPU's rows to compare.
 
 What the `GPU:` line can say:
 
