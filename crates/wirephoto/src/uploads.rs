@@ -174,6 +174,7 @@ pub async fn create(
             return Err(ApiError::invalid("parent is not a folder"));
         }
         let lib = writable(&app, &key, &parent)?;
+        crate::write::folder_on_disk(&app, &lib, &parent)?;
         if let Some(sha) = &sha {
             let sha: [u8; 32] = sha[..].try_into().unwrap();
             if let Some(existing) = same_content(&app, &parent, req.size, &sha)? {
@@ -387,6 +388,7 @@ pub async fn complete(
             if parent.kind != Kind::Folder || parent.is_trashed() {
                 return Err(ApiError::conflict("the folder is gone or in the trash"));
             }
+            crate::write::folder_on_disk(&a, &lib, &parent)?;
             Ok((parent, sha))
         })();
         match ready {

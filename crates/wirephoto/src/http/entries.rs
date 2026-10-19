@@ -156,7 +156,7 @@ pub async fn list_entries(
     Ok(Json(page))
 }
 
-fn list(app: &App, key: &KeyRow, q: ListQuery) -> ApiResult<Page<Entry>> {
+fn list(app: &Arc<App>, key: &KeyRow, q: ListQuery) -> ApiResult<Page<Entry>> {
     let limit = q.limit.unwrap_or(PAGE_DEFAULT);
     if !(1..=PAGE_MAX).contains(&limit) {
         return Err(ApiError::invalid(format!("limit is 1 to {PAGE_MAX}")));
@@ -237,6 +237,8 @@ fn list(app: &App, key: &KeyRow, q: ListQuery) -> ApiResult<Page<Entry>> {
         wh.push("e.sha256 = ?".into());
         args.push(Value::Blob(sha));
     }
+    // A lookup by hash answers "the server has these bytes": only with files on disk as indexed.
+    let lookup = q.sha256.is_some();
     let duplicates = q.duplicates.unwrap_or(false);
     if duplicates {
         wh.push(
@@ -284,6 +286,18 @@ fn list(app: &App, key: &KeyRow, q: ListQuery) -> ApiResult<Page<Entry>> {
                     Ok((EntryRow::from_row(r)?, r.get::<_, Value>(26)?))
                 })?
                 .collect::<Result<_, _>>()?;
+            if lookup {
+                rows.retain(|(r, _)| {
+                    let Some(lib) = app.library(&r.library) else {
+                        return false;
+                    };
+                    let there = crate::indexer::on_disk(lib, r);
+                    if !there {
+                        crate::indexer::forget_later(app, lib, &r.path);
+                    }
+                    there
+                });
+            }
             let next = if rows.len() > limit as usize {
                 rows.truncate(limit as usize);
                 rows.last().map(|(r, v)| encode_cursor(v, r.rowid))

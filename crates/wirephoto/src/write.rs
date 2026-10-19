@@ -26,6 +26,19 @@ use crate::{indexer, media, preview, util};
 /// flight instead of a read back from disk.
 const KEEP_IN_MEMORY: usize = 256 << 20;
 
+/// A folder to write into must be on disk: one deleted behind the server's back is `404`, and forgotten.
+pub(crate) fn folder_on_disk(
+    app: &Arc<App>,
+    lib: &Arc<Library>,
+    folder: &EntryRow,
+) -> ApiResult<()> {
+    if indexer::on_disk(lib, folder) {
+        return Ok(());
+    }
+    indexer::forget_later(app, lib, &folder.path);
+    Err(ApiError::not_found().detail("the folder is no longer on disk"))
+}
+
 pub(crate) fn writable(
     app: &App,
     key: &crate::auth::KeyRow,
@@ -195,13 +208,18 @@ fn first_free(
 }
 
 /// A file in `folder` with exactly these bytes. Files of the same size not hashed yet are hashed now, so the
-/// check cannot miss one.
+/// check cannot miss one; one the index has that is not on disk as indexed (deleted or changed behind the
+/// server's back) never counts, and its folder is listed again.
 pub(crate) fn same_content(
-    app: &App,
+    app: &Arc<App>,
     folder: &EntryRow,
     size: u64,
     sha: &[u8; 32],
 ) -> ApiResult<Option<EntryRow>> {
+    let lib = app
+        .library(&folder.library)
+        .ok_or_else(ApiError::not_found)?
+        .clone();
     let rows: Vec<EntryRow> = app.db.read(|c| {
         let mut st = c.prepare(&format!(
             "SELECT {} FROM {} WHERE e.parent = ? AND e.size = ? AND e.kind != 0 AND e.trashed_at IS NULL AND e.missing = 0",
@@ -214,6 +232,10 @@ pub(crate) fn same_content(
         Ok(rows)
     })?;
     for row in rows {
+        if !indexer::on_disk(&lib, &row) {
+            indexer::forget_later(app, &lib, &row.path);
+            continue;
+        }
         let hash = match row.sha256.as_deref() {
             Some(h) => h.to_vec(),
             None => match indexer::hash_entry(app, &row) {
@@ -291,6 +313,7 @@ async fn save_new(
     let started = std::time::Instant::now();
     let digest = content_digest(&headers)?;
     let lib = writable(&app, &key, &parent)?;
+    folder_on_disk(&app, &lib, &parent)?;
     let wanted = fsx::join(&parent.path, &name);
     let (tmp, sha, kept) = receive(&lib, &wanted, body).await?;
     if let Ok(Some(st)) = lib.fs.stat(&tmp) {
@@ -482,6 +505,7 @@ fn create(
         return Err(ApiError::invalid("parent is not a folder"));
     }
     let lib = writable(app, key, &parent)?;
+    folder_on_disk(app, &lib, &parent)?;
     let parent_id = parent.id.clone();
     let row = match (req.kind, &req.copy_of) {
         (Some(Kind::Folder), None) => {
@@ -528,6 +552,10 @@ fn create(
                 .library(&src.library)
                 .ok_or_else(ApiError::not_found)?
                 .clone();
+            if !indexer::on_disk(&src_lib, &src) {
+                indexer::forget_later(app, &src_lib, &src.path);
+                return Err(ApiError::not_found().detail("it is no longer on disk"));
+            }
             let name = req.name.clone().unwrap_or_else(|| src.name.clone());
             if !fsx::valid_name(&name) {
                 return Err(ApiError::invalid("not a valid name"));

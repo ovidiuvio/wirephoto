@@ -2050,3 +2050,138 @@ async fn upload_sessions_belong_to_their_key_and_expire() {
     rescan(&t).await;
     assert!(row_at(&t, ".wp-uploads").is_none());
 }
+
+/// Files and folders deleted on disk behind the server's back, before it has noticed: never taken for being
+/// there.
+#[tokio::test]
+async fn what_is_gone_from_the_disk_is_never_taken_for_there() {
+    let t = setup().await;
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap().to_string();
+    let bytes = jpeg(640, 480);
+    let sha = hex::encode(Sha256::digest(&bytes));
+    let put = |name: &str| {
+        t.req("PUT", &format!("/v1/entries/{fid}/children/{name}"))
+            .body(Body::from(bytes.clone()))
+            .unwrap()
+    };
+    assert_eq!(t.send(put("one.jpg")).await.status, 201);
+    std::fs::remove_file(t.lib.join("2026/one.jpg")).unwrap();
+
+    // The same bytes again: stored, not "already there".
+    let r = t.send(put("one.jpg")).await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(std::fs::read(t.lib.join("2026/one.jpg")).unwrap(), bytes);
+
+    // A lookup by hash finds only what is on disk.
+    std::fs::remove_file(t.lib.join("2026/one.jpg")).unwrap();
+    let r = t
+        .get(&format!(
+            "/v1/entries?library=lib_nas&sha256={sha}&size={}",
+            bytes.len()
+        ))
+        .await;
+    assert_eq!(
+        r.json()["items"],
+        json!([]),
+        "a deleted file is not offered for dedup"
+    );
+    // Nor does opening an upload session take it for there.
+    let r = t
+        .json(
+            "POST",
+            "/v1/uploads",
+            json!({"parent": fid, "name": "two.jpg", "size": bytes.len(), "sha256": sha}),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+
+    // A folder deleted on disk: writing into it is 404, and the index forgets it.
+    let gone = t.entry_at("/2026/Lisbon").await;
+    let gid = gone["id"].as_str().unwrap().to_string();
+    std::fs::remove_dir_all(t.lib.join("2026/Lisbon")).unwrap();
+    let r = t
+        .send(
+            t.req("PUT", &format!("/v1/entries/{gid}/children/x.jpg"))
+                .body(Body::from(bytes.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 404);
+    assert!(
+        !t.lib.join("2026/Lisbon").exists(),
+        "nothing made in its place"
+    );
+    for _ in 0..50 {
+        if row_at(&t, "2026/Lisbon").is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        row_at(&t, "2026/Lisbon").is_none(),
+        "the index forgot the folder"
+    );
+    assert!(row_at(&t, "2026/Lisbon/a.jpg").is_none());
+}
+
+/// Watching (as on Linux, a watch per folder): a folder deleted on disk leaves the index, and one made again
+/// under its name is watched again.
+#[tokio::test]
+async fn watched_deletes_leave_the_index_and_a_folder_made_again_is_watched() {
+    // SAFETY: tests that read it only ever see it set; per-folder watching is what Linux always does.
+    unsafe { std::env::set_var("WIREPHOTO_WATCH_PER_FOLDER", "1") };
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("photos");
+    std::fs::create_dir_all(lib.join("trip/day1")).unwrap();
+    std::fs::write(lib.join("trip/day1/a.jpg"), jpeg(400, 300)).unwrap();
+    let config: wirephoto::config::Config = toml::from_str(&format!(
+        "data = {:?}\n[[library]]\nid = 'nas'\nname = 'NAS'\npath = {:?}\nwatch = 'auto'\n[decode]\nprogram = {:?}\n[cache]\npregenerate = false\n",
+        dir.path().join("data"),
+        lib,
+        env!("CARGO_BIN_EXE_wirephoto")
+    ))
+    .unwrap();
+    let (app, _router) = wirephoto::build(config).unwrap();
+    let l = app.libraries[0].clone();
+    let watching = wirephoto::indexer::begin_watch(&app, &l);
+    let (a, l2) = (app.clone(), l.clone());
+    tokio::task::spawn_blocking(move || wirephoto::indexer::scan(&a, &l2))
+        .await
+        .unwrap()
+        .unwrap();
+    wirephoto::indexer::watch(app.clone(), l.clone(), watching);
+    let indexed = |path: &'static str, want: bool| {
+        let (app, l) = (app.clone(), l.clone());
+        async move {
+            for _ in 0..100 {
+                let there = app
+                    .db
+                    .read(|c| Ok(wirephoto::db::entry_by_path(c, &l.api_id, path)?))
+                    .unwrap()
+                    .is_some();
+                if there == want {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            false
+        }
+    };
+    assert!(indexed("trip/day1/a.jpg", true).await);
+    std::fs::remove_dir_all(lib.join("trip/day1")).unwrap();
+    assert!(
+        indexed("trip/day1", false).await,
+        "the deleted folder left the index"
+    );
+    assert!(indexed("trip/day1/a.jpg", false).await);
+    // Made again under the same name; then a file in it (after its watch is in place).
+    std::fs::create_dir(lib.join("trip/day1")).unwrap();
+    assert!(indexed("trip/day1", true).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    std::fs::write(lib.join("trip/day1/b.jpg"), jpeg(400, 300)).unwrap();
+    assert!(
+        indexed("trip/day1/b.jpg", true).await,
+        "the folder made again is watched"
+    );
+}

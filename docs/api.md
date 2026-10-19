@@ -370,6 +370,11 @@ and in the background for files already in the library.
   uploading it.
 - **To find duplicates** already in a library: `GET /v1/entries?library={id}&duplicates=true`.
 
+Only files on disk count. A file or folder deleted (or changed) on disk behind the server's back is never
+taken for being there, even before the server has noticed: lookups by hash leave it out, a `PUT` or upload
+session stores the bytes instead of answering with it, a copy of it or a write into such a folder is `404`, and
+the server lists the folder again at once so the index forgets it.
+
 The server never merges or removes duplicates itself.
 
 ## 7. Batch

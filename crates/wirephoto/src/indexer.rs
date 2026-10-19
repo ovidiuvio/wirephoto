@@ -284,6 +284,36 @@ pub fn sync_paths(app: &App, lib: &Library, dirs: HashSet<String>) -> anyhow::Re
     relist(app, lib, start)
 }
 
+/// Whether an entry is on disk as the index has it: a folder, or a file of the same size, time and inode (one
+/// that changed may not have the bytes its hash says).
+pub fn on_disk(lib: &Library, row: &EntryRow) -> bool {
+    match lib.fs.stat(&row.path) {
+        Ok(Some(st)) if row.kind == Kind::Folder => st.is_dir,
+        Ok(Some(st)) => {
+            st.is_file && (st.size, st.mtime_ns, st.ino) == (row.size, row.mtime_ns, row.ino)
+        }
+        _ => false,
+    }
+}
+
+/// An entry was found not to be on disk as indexed: lists its nearest folder still on disk again, in the
+/// background, so the index catches up without waiting for the watcher or the next poll. Never blocks (the
+/// caller may hold the library's lock).
+pub fn forget_later(app: &Arc<App>, lib: &Arc<Library>, rel: &str) {
+    let mut p = fsx::parent_of(rel).to_string();
+    while !p.is_empty() && !lib.fs.stat(&p).ok().flatten().is_some_and(|s| s.is_dir) {
+        p = fsx::parent_of(&p).to_string();
+    }
+    tracing::debug!(library = %lib.api_id, path = rel, "not on disk as indexed: listing {p:?} again");
+    let (app, lib) = (app.clone(), lib.clone());
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        h.spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || sync_paths(&app, &lib, HashSet::from([p])))
+                .await;
+        });
+    }
+}
+
 /// Lists folders again for changes made on disk, and notes when one changed the index (`wirephoto status`).
 fn relist(app: &App, lib: &Library, folders: Vec<Pending>) -> anyhow::Result<()> {
     crate::metrics::Metrics::add(&app.metrics.folders_relisted, folders.len() as u64);
@@ -500,6 +530,7 @@ pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
             while let Ok(ev) = rx.try_recv() {
                 take(ev, &mut dirs);
             }
+            let named: Vec<String> = dirs.iter().cloned().collect();
             let (app2, lib2) = (app.clone(), lib.clone());
             let res = tokio::task::spawn_blocking(move || {
                 if overflow {
@@ -511,6 +542,14 @@ pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
             .await;
             if let Ok(Err(e)) = res {
                 tracing::warn!(library = %lib.api_id, "sync failed: {e:#}");
+            }
+            // A folder deleted on disk took its watch with it: forgotten, so one made again under its name is
+            // watched again (and so is everything that was below it).
+            for rel in named {
+                if !rel.is_empty() && !lib.fs.stat(&rel).ok().flatten().is_some_and(|s| s.is_dir) {
+                    let below = format!("{rel}/");
+                    watched.retain(|w| *w != rel && !w.starts_with(&below));
+                }
             }
             if per_folder()
                 && let Err(e) =
