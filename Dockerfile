@@ -22,10 +22,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && cp /src/target/release/wirephoto /usr/local/bin/wirephoto
 
 FROM debian:trixie-slim
-# HEIF/HEIC (libde265) and AVIF (dav1d) decoding; ffmpeg and ffprobe for video posters and durations (the server
-# runs without them, minus those); tini reaps the decode workers and forwards signals.
+ARG TARGETARCH
+# HEIF/HEIC (libde265) and AVIF (dav1d) decoding; ffmpeg and ffprobe for HEIC, video posters and durations (the
+# server runs without them, minus those); tini reaps the decode workers and forwards signals. On amd64 the VA-API
+# drivers for decoding on the GPU (Intel Quick Sync: intel-media for Broadwell and later, i965 for older; AMD:
+# mesa), used when /dev/dri is mapped into the container, and vainfo to check that it is.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libheif1 libheif-plugin-libde265 libheif-plugin-dav1d ffmpeg tini ca-certificates \
+ && if [ "$TARGETARCH" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends intel-media-va-driver i965-va-driver mesa-va-drivers vainfo; \
+    fi \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /data && chown 1000:1000 /data
 COPY --from=build /usr/local/bin/wirephoto /usr/local/bin/wirephoto

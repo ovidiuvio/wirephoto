@@ -60,11 +60,41 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
             Some(t) => tracing::info!(ffmpeg = %t.ffmpeg.display(), "video posters on"),
             None => tracing::warn!("ffmpeg/ffprobe not found: videos get no posters or durations"),
         }
+        let (candidate, why_not) = gpu_candidate(&config.decode, tools.is_some());
+        let heic_ffmpeg = config.decode.heic == config::HeicMode::Auto && tools.is_some();
+        let gpu = Arc::new(decode::GpuState::new(
+            heic_ffmpeg,
+            candidate.is_some(),
+            why_not,
+        ));
         // Requests' renderings and a probe; background ones get their own workers (half as many, and a probe)
         // at low CPU priority, so they use what requests leave over and never hold up a request's turn.
-        let bg = decode::Pool::with_nice(program.clone(), (n / 2).max(1) + 1, tools.clone(), 10);
+        let bg = decode::Pool::with_nice(
+            program.clone(),
+            (n / 2).max(1) + 1,
+            tools.clone(),
+            10,
+            gpu.clone(),
+        );
+        // Once, here: what the GPU decodes decides the route of every image from now on.
+        if let Some((api, device)) = candidate {
+            let found = bg.probe_gpu(api, device);
+            match found.gpu {
+                Some(g) => {
+                    tracing::info!("decoding on the GPU: {}", g.describe());
+                    if !found.detail.is_empty() {
+                        tracing::info!("the GPU does not decode: {}", found.detail);
+                    }
+                    gpu.found(Some(g.clone()), g.describe());
+                }
+                None => {
+                    tracing::warn!("not decoding on the GPU: {}", found.detail);
+                    gpu.found(None, format!("not used: {}", found.detail));
+                }
+            }
+        }
         (
-            Arc::new(decode::Pool::new(program, n + 1, tools)),
+            Arc::new(decode::Pool::new(program, n + 1, tools, gpu)),
             Arc::new(bg),
         )
     };
@@ -122,6 +152,45 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
     }
     let router = http::router(app.clone());
     Ok((app, router))
+}
+
+/// The GPU to probe at start, or why there is none.
+fn gpu_candidate(
+    cfg: &config::DecodeConfig,
+    ffmpeg: bool,
+) -> (Option<(decode::accel::Api, Option<String>)>, String) {
+    if cfg.gpu == config::GpuMode::Off {
+        return (None, "off ([decode] gpu = \"off\")".into());
+    }
+    if !ffmpeg {
+        return (None, "none: no ffmpeg".into());
+    }
+    if cfg!(target_os = "macos") {
+        if cfg.gpu != config::GpuMode::On {
+            return (
+                None,
+                "not used: VideoToolbox is slower than the CPU path here ([decode] gpu = \"on\" uses it)".into(),
+            );
+        }
+        return (
+            Some((decode::accel::Api::VideoToolbox, None)),
+            String::new(),
+        );
+    }
+    if cfg!(target_os = "linux") {
+        let dev = cfg
+            .gpu_device
+            .clone()
+            .unwrap_or_else(|| decode::accel::DEFAULT_DEVICE.to_string());
+        if !std::path::Path::new(&dev).exists() {
+            return (
+                None,
+                format!("none: no {dev} (map /dev/dri into the container)"),
+            );
+        }
+        return (Some((decode::accel::Api::Vaapi, Some(dev))), String::new());
+    }
+    (None, "none on this system".into())
 }
 
 /// Starts indexing, watching and the background passes.

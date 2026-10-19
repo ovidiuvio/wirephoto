@@ -104,6 +104,34 @@ pub struct DecodeConfig {
     /// The `wirephoto` binary the workers run (`<program> decode`). Default: the running one.
     #[serde(default)]
     pub program: Option<PathBuf>,
+    /// Decoding on the GPU: `auto` uses a VA-API GPU (Intel Quick Sync, AMD) on Linux when found working at
+    /// start; `on` also VideoToolbox on macOS (for development: there the CPU path is faster); `off` never.
+    #[serde(default)]
+    pub gpu: GpuMode,
+    /// The GPU's render node (VA-API). Default: /dev/dri/renderD128.
+    #[serde(default)]
+    pub gpu_device: Option<String>,
+    /// HEIC decoding: `auto` through ffmpeg (on the GPU when it takes the file, else on the CPU, several times
+    /// faster than libheif), `libheif` only through libheif. libheif decodes whatever ffmpeg cannot either way.
+    #[serde(default)]
+    pub heic: HeicMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeicMode {
+    #[default]
+    Auto,
+    Libheif,
 }
 
 #[derive(Debug, Clone, Deserialize)]

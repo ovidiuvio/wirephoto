@@ -63,6 +63,15 @@ impl ReadAt for [u8] {
     }
 }
 
+impl ReadAt for Vec<u8> {
+    fn read_at(&self, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+        self[..].read_at(start, end)
+    }
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
 struct Candidate {
     offset: u64,
     length: u64,

@@ -198,6 +198,31 @@ pub fn decode_heif(bytes: &[u8]) -> anyhow::Result<Decoded> {
     })
 }
 
+/// What decoding a HEIF elsewhere needs from libheif: whether it has transparency, and its ICC profile.
+pub struct HeifMeta {
+    pub alpha: bool,
+    pub icc: Option<Vec<u8>>,
+}
+
+/// The primary image's [`HeifMeta`] (the container is parsed, nothing decoded).
+#[cfg(feature = "heic")]
+pub fn heif_meta(bytes: &[u8]) -> Option<HeifMeta> {
+    let ctx = libheif_rs::HeifContext::read_from_bytes(bytes).ok()?;
+    let handle = ctx.primary_image_handle().ok()?;
+    Some(HeifMeta {
+        alpha: handle.has_alpha_channel(),
+        icc: handle.color_profile_raw().map(|p| p.data),
+    })
+}
+
+#[cfg(not(feature = "heic"))]
+pub fn heif_meta(_: &[u8]) -> Option<HeifMeta> {
+    Some(HeifMeta {
+        alpha: false,
+        icc: None,
+    })
+}
+
 #[cfg(not(feature = "heic"))]
 pub fn decode_heif(_: &[u8]) -> anyhow::Result<Decoded> {
     bail!("built without HEIF support")

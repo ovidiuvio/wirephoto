@@ -2,10 +2,11 @@
 //! filter that refuses the network, creating or changing files, and the kernel interfaces a decoder never needs.
 //! Reading stays allowed: the shared libraries, and ffmpeg (which inherits the filter) reading its input. The
 //! filter is a deny list, so decoders and the allocator keep working across libc and kernel versions.
+//! A worker started for the GPU may also open files read-write (its render node); see `[decode] gpu`.
 //! Elsewhere (macOS, for development) the worker is only a separate process.
 
 #[cfg(target_os = "linux")]
-pub fn enter() -> anyhow::Result<()> {
+pub fn enter(gpu: bool) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
 
     use anyhow::{Context, bail};
@@ -130,8 +131,12 @@ pub fn enter() -> anyhow::Result<()> {
 
     // Opening for anything but reading.
     let writing = |arg: u8| -> anyhow::Result<Vec<SeccompRule>> {
-        [libc::O_WRONLY, libc::O_RDWR, libc::O_CREAT, libc::O_TRUNC]
+        // A worker that decodes on the GPU opens its render node read-write (no way to name only that file
+        // here); creating and truncating files stays refused.
+        let rdwr: &[i32] = if gpu { &[] } else { &[libc::O_RDWR] };
+        [libc::O_WRONLY, libc::O_CREAT, libc::O_TRUNC]
             .into_iter()
+            .chain(rdwr.iter().copied())
             .map(|flag| {
                 Ok(SeccompRule::new(vec![Cond::new(
                     arg,
@@ -204,6 +209,6 @@ fn unfiltered(why: std::io::Error) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn enter() -> anyhow::Result<()> {
+pub fn enter(_gpu: bool) -> anyhow::Result<()> {
     Ok(())
 }

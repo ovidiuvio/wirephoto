@@ -1372,6 +1372,9 @@ pub struct Snapshot {
     pub background: usize,
     pub workers_started: u64,
     pub workers_lost: u64,
+    /// The GPU: what it decodes, or why it is not used.
+    #[serde(default)]
+    pub gpu: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1419,6 +1422,7 @@ fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Sna
         background: p.slots.1,
         workers_started,
         workers_lost,
+        gpu: p.pool().gpu().status(),
     }
 }
 

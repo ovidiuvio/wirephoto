@@ -11,12 +11,80 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use parking_lot::{Condvar, Mutex};
 
-use super::{MAX_MESSAGE, Op, Probe, Request, Tools, send_with_fd};
+use super::accel::{self, Gpu, ProbeResult};
+use super::{Accel, MAX_MESSAGE, Op, Probe, Request, Tools, how, send_with_fd};
 
 /// What a worker reads: an open file (sent as a read-only descriptor) or bytes still in memory.
 pub enum Input {
     File(std::fs::File),
     Bytes(Arc<Vec<u8>>),
+}
+
+/// A reply, and how it was made ([`how`]).
+pub struct Done {
+    pub bytes: Vec<u8>,
+    pub made: u8,
+}
+
+/// GPU failures in a row after which the GPU is left alone until the next start.
+const GPU_GIVE_UP: u64 = 5;
+
+/// The faster ways to decode, found once at start ([`Pool::probe_gpu`]) and shared by the pools. A GPU that
+/// keeps failing is turned off for the rest of the run.
+pub struct GpuState {
+    accel: parking_lot::RwLock<Accel>,
+    /// What `wirephoto status` says about the GPU.
+    status: parking_lot::RwLock<String>,
+    in_a_row: AtomicU64,
+    /// Workers are started able to open the GPU (their sandbox lets them open its render node read-write).
+    pub allow: bool,
+}
+
+impl GpuState {
+    pub fn new(heic_ffmpeg: bool, allow: bool, status: String) -> GpuState {
+        GpuState {
+            accel: parking_lot::RwLock::new(Accel {
+                gpu: None,
+                heic_ffmpeg,
+            }),
+            status: parking_lot::RwLock::new(status),
+            in_a_row: AtomicU64::new(0),
+            allow,
+        }
+    }
+
+    pub fn accel(&self) -> Accel {
+        self.accel.read().clone()
+    }
+
+    pub fn gpu(&self) -> Option<Gpu> {
+        self.accel.read().gpu.clone()
+    }
+
+    pub fn status(&self) -> String {
+        self.status.read().clone()
+    }
+
+    /// The probe's outcome.
+    pub fn found(&self, gpu: Option<Gpu>, status: String) {
+        self.accel.write().gpu = gpu;
+        *self.status.write() = status;
+    }
+
+    fn record(&self, made: u8) {
+        if made & how::GPU_FAILED != 0 {
+            let n = self.in_a_row.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= GPU_GIVE_UP && self.accel.read().gpu.is_some() {
+                self.accel.write().gpu = None;
+                let why =
+                    format!("turned off after {n} failures in a row (back on at the next start)");
+                tracing::warn!("GPU decoding {why}; decoding on the CPU");
+                *self.status.write() = why;
+            }
+        } else if made & !how::GPU_FAILED == how::GPU {
+            self.in_a_row.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 struct Worker {
@@ -49,6 +117,7 @@ pub struct Pool {
     in_a_row: AtomicU64,
     /// CPU priority the workers lower themselves to (`nice`): 0, or more for background work.
     nice: i32,
+    gpu: Arc<GpuState>,
 }
 
 /// How long a worker may take over one image, and over one video.
@@ -57,13 +126,19 @@ const VIDEO_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl Pool {
     /// A pool of up to `max` workers running `program decode`; `tools` are ffmpeg and ffprobe, if found.
-    pub fn new(program: PathBuf, max: usize, tools: Option<Tools>) -> Pool {
-        Self::with_nice(program, max, tools, 0)
+    pub fn new(program: PathBuf, max: usize, tools: Option<Tools>, gpu: Arc<GpuState>) -> Pool {
+        Self::with_nice(program, max, tools, 0, gpu)
     }
 
     /// The same, with workers that run at a lower CPU priority (`nice`): the kernel gives the CPU to other work
     /// first, so background renderings use what requests leave over.
-    pub fn with_nice(program: PathBuf, max: usize, tools: Option<Tools>, nice: i32) -> Pool {
+    pub fn with_nice(
+        program: PathBuf,
+        max: usize,
+        tools: Option<Tools>,
+        nice: i32,
+        gpu: Arc<GpuState>,
+    ) -> Pool {
         Pool {
             program,
             max: max.max(1),
@@ -77,7 +152,36 @@ impl Pool {
             lost: AtomicU64::new(0),
             in_a_row: AtomicU64::new(0),
             nice,
+            gpu,
         }
+    }
+
+    /// Asks a worker what the GPU decodes (once, at start).
+    pub fn probe_gpu(&self, api: accel::Api, device: Option<String>) -> ProbeResult {
+        if self.tools.is_none() {
+            return ProbeResult {
+                gpu: None,
+                detail: "no ffmpeg".into(),
+            };
+        }
+        match self.run(
+            Op::GpuProbe { api, device },
+            Input::Bytes(Arc::new(Vec::new())),
+        ) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| ProbeResult {
+                gpu: None,
+                detail: format!("unreadable probe: {e}"),
+            }),
+            Err(e) => ProbeResult {
+                gpu: None,
+                detail: format!("{e:#}"),
+            },
+        }
+    }
+
+    /// The GPU state the pools share.
+    pub fn gpu(&self) -> &Arc<GpuState> {
+        &self.gpu
     }
 
     /// Whether videos can be probed and get posters.
@@ -96,6 +200,11 @@ impl Pool {
     /// Runs one request in a worker (blocking). Errors are the decoder's ([`DecodeFailed`]: the file cannot be
     /// read), or anything else: the worker's death, a timeout, no worker to start.
     pub fn run(&self, op: Op, input: Input) -> anyhow::Result<Vec<u8>> {
+        self.run_full(op, input).map(|d| d.bytes)
+    }
+
+    /// [`Pool::run`], saying how the reply was made.
+    pub fn run_full(&self, op: Op, input: Input) -> anyhow::Result<Done> {
         let timeout = match &op {
             Op::Preview {
                 format: super::Format::Video { .. },
@@ -111,12 +220,16 @@ impl Pool {
                 Input::File(_) => None,
             },
             tools: self.tools.clone(),
+            accel: self.gpu.accel(),
         };
         let mut w = self.checkout()?;
         match exchange(&mut w, &req, &input, timeout) {
             Ok(reply) => {
                 self.checkin(w);
                 self.in_a_row.store(0, Ordering::Relaxed);
+                if let Ok(d) = &reply {
+                    self.gpu.record(d.made);
+                }
                 reply
             }
             Err(e) => {
@@ -195,6 +308,9 @@ impl Pool {
         if self.nice > 0 {
             cmd.env("WIREPHOTO_WORKER_NICE", self.nice.to_string());
         }
+        if self.gpu.allow {
+            cmd.env("WIREPHOTO_WORKER_GPU", "1");
+        }
         let child = cmd
             .arg("decode")
             .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
@@ -213,7 +329,7 @@ fn exchange(
     req: &Request,
     input: &Input,
     timeout: Duration,
-) -> anyhow::Result<anyhow::Result<Vec<u8>>> {
+) -> anyhow::Result<anyhow::Result<Done>> {
     w.sock.set_read_timeout(Some(timeout))?;
     w.sock.set_write_timeout(Some(timeout))?;
     let json = serde_json::to_vec(req)?;
@@ -227,18 +343,22 @@ fn exchange(
             w.sock.write_all(b)?;
         }
     }
-    let mut status = [0u8; 5];
+    let mut status = [0u8; 6];
     w.sock
         .read_exact(&mut status)
         .map_err(|e| anyhow!("no reply: {e}"))?;
-    let len = u32::from_le_bytes(status[1..].try_into().unwrap()) as usize;
+    let made = status[1];
+    let len = u32::from_le_bytes(status[2..].try_into().unwrap()) as usize;
     if len > MAX_MESSAGE {
         bail!("reply too large");
     }
     let mut payload = vec![0u8; len];
     w.sock.read_exact(&mut payload)?;
     Ok(match status[0] {
-        0 => Ok(payload),
+        0 => Ok(Done {
+            bytes: payload,
+            made,
+        }),
         _ => Err(DecodeFailed(String::from_utf8_lossy(&payload).into_owned()).into()),
     })
 }
@@ -260,4 +380,37 @@ impl std::error::Error for DecodeFailed {}
 /// Whether an error says the file itself cannot be decoded (as opposed to a failure that may pass).
 pub fn is_decode_failure(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<DecodeFailed>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu() -> Gpu {
+        Gpu {
+            api: accel::Api::Vaapi,
+            device: None,
+            hevc: true,
+            hevc10: false,
+            jpeg: true,
+        }
+    }
+
+    #[test]
+    fn a_failing_gpu_is_turned_off() {
+        let s = GpuState::new(true, true, String::new());
+        s.found(Some(gpu()), gpu().describe());
+        // Failures with successes between them keep it on.
+        for _ in 0..10 {
+            s.record(how::NATIVE | how::GPU_FAILED);
+            s.record(how::GPU);
+        }
+        assert!(s.gpu().is_some());
+        for _ in 0..GPU_GIVE_UP {
+            s.record(how::FFMPEG | how::GPU_FAILED);
+        }
+        assert!(s.gpu().is_none(), "off after {GPU_GIVE_UP} in a row");
+        assert!(s.accel().heic_ffmpeg, "the CPU paths stay");
+        assert!(s.status().contains("turned off"));
+    }
 }

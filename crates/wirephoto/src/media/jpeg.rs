@@ -72,6 +72,21 @@ pub fn info(b: &[u8]) -> Option<JpegInfo> {
     })
 }
 
+/// A baseline JPEG (SOF0) in YCbCr or grey: what GPU decoders take. Progressive, arithmetic-coded and CMYK
+/// ones are not.
+pub fn baseline(b: &[u8]) -> bool {
+    let mut sof0 = None;
+    segments(b, |m, seg| match m {
+        0xC0 => {
+            sof0 = seg.get(5).copied();
+            false
+        }
+        0xC1..=0xCF if m != 0xC4 && m != 0xC8 && m != 0xCC => false,
+        _ => true,
+    });
+    matches!(sof0, Some(1 | 3))
+}
+
 /// The JPEG's EXIF payload (the TIFF structure after `Exif\0\0`).
 pub fn exif(b: &[u8]) -> Option<&[u8]> {
     let mut out = None;

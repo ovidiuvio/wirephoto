@@ -14,9 +14,19 @@ use crate::preview::render::{Decoded, Rgb};
 /// The largest poster ffmpeg may hand back (8K RGB).
 const MAX_PIXELS: usize = 7680 * 4320;
 
-enum Input {
+pub(super) enum Input {
     File(std::fs::File),
     Bytes(Arc<Vec<u8>>),
+}
+
+impl Input {
+    /// The source again, for another run (the caller keeps it).
+    pub(super) fn of(src: &Source) -> std::io::Result<Input> {
+        Ok(match src {
+            Source::File(f) => Input::File(f.try_clone()?),
+            Source::Bytes(b) => Input::Bytes(Arc::new(b.clone())),
+        })
+    }
 }
 
 impl From<Source> for Input {
@@ -29,7 +39,7 @@ impl From<Source> for Input {
 }
 
 /// Runs `cmd` with the source as stdin and returns its stdout.
-fn run(mut cmd: Command, input: &Input) -> anyhow::Result<Vec<u8>> {
+pub(super) fn run(mut cmd: Command, input: &Input) -> anyhow::Result<Vec<u8>> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let feed = match input {
         Input::File(f) => {
@@ -63,19 +73,44 @@ fn run(mut cmd: Command, input: &Input) -> anyhow::Result<Vec<u8>> {
 }
 
 /// A frame about 10% in (the first frame when the duration is unknown or that fails), fitted within `size`.
+/// Decoded on `gpu` when given (ffmpeg uses the CPU by itself for what the GPU does not decode), on the CPU when
+/// that fails.
 pub(super) fn poster(
     tools: &Tools,
+    gpu: Option<&super::accel::Gpu>,
     src: Source,
     duration: Option<f64>,
     size: u32,
 ) -> anyhow::Result<Decoded> {
-    let input = Input::from(src);
+    if let Some(g) = gpu {
+        let again = Input::of(&src)?;
+        match poster_with(tools, Some(g), Input::from(src), duration, size) {
+            Ok(d) => return Ok(d),
+            Err(e) => {
+                eprintln!("wirephoto decode: poster on the GPU failed, using the CPU: {e:#}");
+                return poster_with(tools, None, again, duration, size);
+            }
+        }
+    }
+    poster_with(tools, None, Input::from(src), duration, size)
+}
+
+fn poster_with(
+    tools: &Tools,
+    gpu: Option<&super::accel::Gpu>,
+    input: Input,
+    duration: Option<f64>,
+    size: u32,
+) -> anyhow::Result<Decoded> {
     let at = duration
         .filter(|d| d.is_finite() && *d > 0.0)
         .map(|d| d * 0.1);
     let grab = |at: Option<f64>| -> anyhow::Result<Vec<u8>> {
         let mut cmd = Command::new(&tools.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-threads", "1"]);
+        if let Some(g) = gpu {
+            cmd.args(g.input_args(false));
+        }
         if let Some(t) = at {
             cmd.args(["-ss", &format!("{t:.3}")]);
         }
@@ -129,7 +164,7 @@ pub(super) fn poster(
 }
 
 /// A binary PPM (P6, 8-bit) -> pixels.
-fn parse_ppm(b: &[u8]) -> anyhow::Result<Rgb> {
+pub(super) fn parse_ppm(b: &[u8]) -> anyhow::Result<Rgb> {
     let mut fields = Vec::with_capacity(4);
     let mut i = 0;
     while fields.len() < 4 {

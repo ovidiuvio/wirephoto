@@ -364,11 +364,16 @@ impl RenderJob {
             }
             self.renders.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let jpeg = render(&self.pool, &self.entry, &self.src, self.size)?;
-            self.stats.record(
-                &kind_label(&self.entry),
-                started.elapsed().as_millis() as u64,
-            );
+            let done = render(&self.pool, &self.entry, &self.src, self.size)?;
+            let jpeg = done.bytes;
+            let label = kind_label(&self.entry);
+            let label = match done.made & !crate::decode::how::GPU_FAILED {
+                crate::decode::how::GPU => format!("{label} (GPU)"),
+                crate::decode::how::FFMPEG => format!("{label} (ffmpeg)"),
+                _ => label,
+            };
+            self.stats
+                .record(&label, started.elapsed().as_millis() as u64);
             tracing::debug!(
                 path = %self.entry.path,
                 size = self.size,
@@ -428,8 +433,13 @@ pub fn format(entry: &EntryRow) -> Format {
     }
 }
 
-/// Makes the JPEG in a decode worker (blocking).
-pub fn render(pool: &Pool, entry: &EntryRow, src: &Source, size: u32) -> anyhow::Result<Vec<u8>> {
+/// Makes the JPEG in a decode worker (blocking), saying how it was decoded.
+pub fn render(
+    pool: &Pool,
+    entry: &EntryRow,
+    src: &Source,
+    size: u32,
+) -> anyhow::Result<crate::decode::Done> {
     let input = match src {
         Source::File(fs, rel) => Input::File(fs.open_file(rel)?),
         Source::Bytes(b) => Input::Bytes(b.clone()),
@@ -439,7 +449,7 @@ pub fn render(pool: &Pool, entry: &EntryRow, src: &Source, size: u32) -> anyhow:
         size,
         cache: size == CACHED_SIZE,
     };
-    pool.run(op, input)
+    pool.run_full(op, input)
 }
 
 #[cfg(test)]

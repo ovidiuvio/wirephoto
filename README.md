@@ -9,7 +9,8 @@ browse, open, organise and save photos there.
   request.
 - **Every file type**: any file can be listed, downloaded, written, moved and trashed; previews for JPEG, PNG,
   GIF, WebP, TIFF, BMP, HEIC/HEIF/AVIF, camera RAW and video (a poster frame, with ffmpeg), decoded in sandboxed
-  worker processes.
+  worker processes. HEIC, large JPEGs and video posters decode on the GPU (Intel Quick Sync and other VA-API
+  GPUs) when one is mapped into the container.
 - **Safe with your files**: the folders on disk stay the truth; byte writes are version-checked and
   integrity-checked; deletes go to a trash.
 - **Small to run**: one container, one config file, one data folder.
@@ -25,6 +26,9 @@ docker compose up -d
 with [docker-compose.yml](docker-compose.yml) and a `wirephoto.toml` next to it (start from
 [wirephoto.example.toml](wirephoto.example.toml)). The image is published for `linux/amd64` and `linux/arm64` at
 `ghcr.io/ovidiuvio/wirephoto`.
+
+On a Synology NAS, follow [docs/synology.md](docs/synology.md): Container Manager, permissions, decoding on the
+GPU (Intel Quick Sync), watch limits and HTTPS, step by step.
 
 Create a key for each app, on the server:
 
@@ -83,7 +87,9 @@ from the design:
   process interfaces), installed with `seccomp()` or, on older kernels (many NAS systems), `prctl`; a kernel with
   no seccomp filters at all gets none (the worker says so on stderr; `WIREPHOTO_SECCOMP=required` refuses
   instead). Running as root, workers drop to `nobody`; otherwise they share the server's user and could still
-  signal it
+  signal it; with a GPU in use they may also open files read-write (its render node), still not create or truncate them
+- GPU decoding is tested with VideoToolbox on macOS and the CPU path everywhere; VA-API (Quick Sync) on real
+  hardware is checked by the startup probe, whose result `wirephoto status` shows
 - zstd/brotli for downloads of uncompressed RAW and TIFF; multi-range requests
 - neighbour readahead when an original is opened; newest-first preview scheduling
 - a generated OpenAPI document

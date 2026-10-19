@@ -7,7 +7,7 @@
 
 services:
   wirephoto:
-    image: ghcr.io/ovidiuvio/wirephoto:latest
+    image: ghcr.io/ovidiuvio/wirephoto:main
     container_name: wirephoto
     user: "1000:1000"
     read_only: true
@@ -19,6 +19,12 @@ services:
       - ./wirephoto.toml:/etc/wirephoto.toml:ro
       - /volume1/photos:/photos              # the library (add :ro and read_only = true to serve it read-only)
       - /volume1/docker/wirephoto:/data      # index and preview cache: an SSD if you have one
+    # Decoding on the GPU (Intel Quick Sync): the render node, and its group (`ls -ln /dev/dri` on the host shows
+    # the number). Leave both out if the host has no /dev/dri; see docs/synology.md.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "937"
     environment:
       WIREPHOTO_LOG: "wirephoto=info"
     restart: unless-stopped

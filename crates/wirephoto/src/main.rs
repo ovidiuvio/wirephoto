@@ -724,5 +724,8 @@ fn status(config: &Config) -> anyhow::Result<()> {
         "Decode workers: {} at once ({} for pre-generation); {} started, {} lost",
         s.workers, s.background, s.workers_started, s.workers_lost
     );
+    if !s.gpu.is_empty() {
+        println!("GPU: {}", s.gpu);
+    }
     Ok(())
 }
