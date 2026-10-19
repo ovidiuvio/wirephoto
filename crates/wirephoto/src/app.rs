@@ -84,6 +84,8 @@ pub struct App {
     pub api_activity: std::sync::atomic::AtomicI64,
     /// Background work is waiting for the API to go idle (for the progress log and `wirephoto status`).
     pub yielding: std::sync::atomic::AtomicBool,
+    /// Index writes so far ([`App::write`]): progress is counted again only after one.
+    pub writes: AtomicU64,
 }
 
 impl App {
@@ -133,7 +135,13 @@ impl App {
         Ok(out)
     }
 
+    /// How many index writes there have been ([`App::writes`]).
+    pub fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
     pub fn changed(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
         if let Ok(seq) = self.db.read(|c| Ok(crate::db::current_seq(c)?)) {
             self.seq.send_if_modified(|s| {
                 let moved = *s != seq;

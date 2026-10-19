@@ -147,7 +147,7 @@ fn pregenerate(app: &Arc<App>, entry_id: String, src: preview::Source) {
             .flatten();
         if let Some(row) = row.filter(|r| r.previewable) {
             let ok = app.previews.ensure_cached(&row, src).await.is_ok();
-            let _ = app.db.write(|t| {
+            let _ = app.write(|t| {
                 t.execute("UPDATE entries SET preview_done = 1, previewable = previewable AND ? WHERE rowid = ?", params![ok, row.rowid])?;
                 Ok(())
             });

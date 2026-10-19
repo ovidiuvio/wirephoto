@@ -654,6 +654,8 @@ fn status(config: &Config) -> anyhow::Result<()> {
     let s: wirephoto::indexer::Snapshot = serde_json::from_slice(&raw)?;
     let now = wirephoto::util::now_secs();
     let ago = now - s.time;
+    // The status is saved when it changes, not on a clock: whether the server runs is asked of the server.
+    let running = health(config).is_ok();
     let words = |secs: i64| -> String {
         let m = secs / 60;
         match m {
@@ -662,11 +664,12 @@ fn status(config: &Config) -> anyhow::Result<()> {
             _ => format!("{} h {:02} min", m / 60, m % 60),
         }
     };
-    println!("wirephoto {}, up {}", s.version, words(s.time - s.started));
+    let up = if running { now } else { s.time } - s.started;
+    println!("wirephoto {}, up {}", s.version, words(up));
     if wirephoto::indexer::paused_in(&db) {
         println!("  background work is PAUSED (wirephoto resume continues it)");
     }
-    if ago > 90 {
+    if !running {
         println!(
             "  (as of {} ago: the server seems to be stopped)",
             words(ago)

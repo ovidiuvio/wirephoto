@@ -113,6 +113,13 @@ fn configure(c: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The preview queue (indexer::preview_pass), in the inode order it is worked in: only the entries still to do,
+/// so looking at an empty queue reads nothing instead of the whole table. (The hash queue has `entries_sha`.)
+const TODO_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS entries_preview_todo ON entries(dev, ino)
+    WHERE previewable = 1 AND preview_done = 0 AND trashed_at IS NULL AND missing = 0;
+"#;
+
 /// Columns added to the schema after indexes had been created with it: added to an older index on open.
 const ADDED_COLUMNS: &[(&str, &str)] = &[("entries", "hash_deferred INTEGER NOT NULL DEFAULT 0")];
 
@@ -133,6 +140,7 @@ impl Db {
                 writer.execute(&format!("ALTER TABLE {table} ADD COLUMN {column}"), [])?;
             }
         }
+        writer.execute_batch(TODO_INDEXES)?;
         let manager = SqliteConnectionManager::file(path).with_init(|c| {
             c.busy_timeout(std::time::Duration::from_secs(10))?;
             c.pragma_update(None, "query_only", "ON")

@@ -307,6 +307,22 @@ fn poll(app: &App, lib: &Library) -> anyhow::Result<()> {
     walk(app, lib, changed, false)
 }
 
+/// Whether a filesystem event may mean a change. Opening something, or closing it after only reading, does not:
+/// inotify reports both (for a folder too, when it is listed), so taking them for changes made every listing
+/// set off another, forever, and every read of a photo (a download, Synology's indexer, a backup) started one.
+fn is_change(ev: &notify::Result<notify::Event>) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    match ev {
+        Ok(ev) => !matches!(
+            ev.kind,
+            EventKind::Access(
+                AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read)
+            )
+        ),
+        Err(_) => true,
+    }
+}
+
 /// A library's filesystem watcher, registered but not yet applied: events queue until [`watch`] runs.
 pub struct Watching {
     watcher: Option<notify::RecommendedWatcher>,
@@ -387,7 +403,9 @@ pub fn begin_watch(app: &App, lib: &Library) -> Watching {
         None
     } else {
         match notify::recommended_watcher(move |ev| {
-            let _ = tx.send(ev);
+            if is_change(&ev) {
+                let _ = tx.send(ev);
+            }
         }) {
             Err(e) => {
                 unavailable(&e);
@@ -707,6 +725,10 @@ async fn preview_pass(app: &Arc<App>) -> anyhow::Result<usize> {
         let rows = st.query_map([], EntryRow::from_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })?;
+    if rows.is_empty() {
+        // Nothing to do, so no write: every write wakes the background loop, which would then never sleep.
+        return Ok(0);
+    }
     let n = rows.len();
     let jobs = rows.into_iter().filter_map(|row| {
         let lib = app.library(&row.library)?.clone();
@@ -830,7 +852,7 @@ fn hash_pass(app: &App) -> anyhow::Result<usize> {
         };
         if let Some(why) = failed {
             log_hash_failure(&row.library, &row.path, &why);
-            app.db.write(|t| {
+            app.write(|t| {
                 t.execute(
                     "UPDATE entries SET hash_deferred = 1 WHERE rowid = ?",
                     [row.rowid],
@@ -863,47 +885,17 @@ pub async fn background(app: Arc<App>) {
     tokio::spawn(facts_loop(app.clone()));
     tokio::spawn(hash_loop(app.clone()));
     let mut changes = app.seq.subscribe();
+    // The index write the progress was last counted after: counting reads the whole library, so it waits for a
+    // write that may have changed it.
+    let mut counted = None;
     loop {
         if paused(&app) {
             tokio::time::sleep(PAUSE_CHECK).await;
             continue;
         }
-        for lib in &app.libraries {
-            if lib
-                .status
-                .get()
-                .is_some_and(|s| s.state == IndexingState::Scanning)
-            {
-                continue;
-            }
-            if let Ok((facts, hashes)) = pending_counts(&app, &lib.api_id) {
-                let total: i64 = app
-                    .db
-                    .read(|c| {
-                        Ok(c.query_row(
-                            "SELECT COUNT(*) FROM entries WHERE library = ? AND kind != 0",
-                            [&lib.api_id],
-                            |r| r.get(0),
-                        )?)
-                    })
-                    .unwrap_or(0);
-                let total = total as u64;
-                if facts > 0 {
-                    lib.status.set(
-                        Some(IndexingState::Reading),
-                        total.saturating_sub(facts),
-                        total,
-                    );
-                } else if hashes > 0 {
-                    lib.status.set(
-                        Some(IndexingState::Hashing),
-                        total.saturating_sub(hashes),
-                        total,
-                    );
-                } else {
-                    lib.status.set(None, 0, 0);
-                }
-            }
+        let writes = app.writes();
+        if counted != Some(writes) && count_progress(&app) {
+            counted = Some(writes);
         }
         // Previews here; facts and hashes in loops of their own beside this one (facts_loop, hash_loop): previews
         // are CPU work, hashing is disk work and reading facts is light, so none waits for another to finish.
@@ -923,6 +915,53 @@ pub async fn background(app: Arc<App>) {
             }
         }
     }
+}
+
+/// Counts each library's progress for `GET /v1/libraries` (a scan reports its own). Returns whether every
+/// library was counted.
+fn count_progress(app: &App) -> bool {
+    let mut all = true;
+    for lib in &app.libraries {
+        if lib
+            .status
+            .get()
+            .is_some_and(|s| s.state == IndexingState::Scanning)
+        {
+            all = false; // counted again once the scan is done
+            continue;
+        }
+        if let Ok((facts, hashes)) = pending_counts(app, &lib.api_id) {
+            let total: i64 = app
+                .db
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM entries WHERE library = ? AND kind != 0",
+                        [&lib.api_id],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap_or(0);
+            let total = total as u64;
+            if facts > 0 {
+                lib.status.set(
+                    Some(IndexingState::Reading),
+                    total.saturating_sub(facts),
+                    total,
+                );
+            } else if hashes > 0 {
+                lib.status.set(
+                    Some(IndexingState::Hashing),
+                    total.saturating_sub(hashes),
+                    total,
+                );
+            } else {
+                lib.status.set(None, 0, 0);
+            }
+        } else {
+            all = false;
+        }
+    }
+    all
 }
 
 /// How often paused background work looks whether it may resume.
@@ -1138,8 +1177,16 @@ pub async fn report(app: Arc<App>) {
     let pregenerate = app.config.cache.pregenerate;
     let started = crate::util::now_secs();
     let mut was_paused: HashSet<String> = HashSet::new();
+    // Counting reads the whole library: done again only after an index write (App::writes).
+    let mut counted_after: Option<u64> = None;
+    // The status last saved (without its time): saved again only when it changes, so an idle server leaves
+    // the disks alone.
+    let mut saved: Option<Vec<u8>> = None;
     loop {
         tokio::time::sleep(EVERY).await;
+        let writes = app.writes();
+        let recount = counted_after != Some(writes);
+        counted_after = Some(writes);
         let mut lines: Vec<(String, String)> = Vec::new();
         for lib in &app.libraries {
             let id = lib.api_id.clone();
@@ -1161,7 +1208,9 @@ pub async fn report(app: Arc<App>) {
                 continue;
             }
             let lib_id = id.clone();
-            let counts = app.db.read(move |c| {
+            let counts = match last.get(&id) {
+                Some((prev, ..)) if !recount => Ok(*prev),
+                _ => app.db.read(move |c| {
                 Ok(c.query_row(
                     "SELECT COALESCE(SUM(kind != 0), 0),
                             COALESCE(SUM(kind != 0 AND media_state = 0), 0),
@@ -1186,7 +1235,8 @@ pub async fn report(app: Arc<App>) {
                         })
                     },
                 )?)
-            });
+            }),
+            };
             let Ok(now) = counts else { continue };
             let previews_pending = if pregenerate { now.previews_pending } else { 0 };
             let busy = now.facts_pending + previews_pending + now.hashes_pending > 0;
@@ -1289,9 +1339,18 @@ pub async fn report(app: Arc<App>) {
             }
             last.insert(id, (now, busy, 0));
         }
-        let snapshot = status_snapshot(&app, started, lines);
-        if let Ok(json) = serde_json::to_vec(&snapshot) {
-            let _ = app.db.meta_set("status", &json);
+        let mut snapshot = status_snapshot(&app, started, lines);
+        let time = std::mem::take(&mut snapshot.time);
+        let Ok(unchanged) = serde_json::to_vec(&snapshot) else {
+            continue;
+        };
+        if saved.as_ref() != Some(&unchanged) {
+            snapshot.time = time;
+            if let Ok(json) = serde_json::to_vec(&snapshot)
+                && app.db.meta_set("status", &json).is_ok()
+            {
+                saved = Some(unchanged);
+            }
         }
     }
 }
@@ -1402,6 +1461,29 @@ pub async fn settle(app: &Arc<App>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reading_is_not_a_change() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind,
+        };
+        let ev = |kind| Ok(notify::Event::new(kind));
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            assert!(!super::is_change(&ev(kind)), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            assert!(super::is_change(&ev(kind)), "{kind:?}");
+        }
+    }
+
     #[test]
     fn numbers_and_durations() {
         assert_eq!(super::thousands(0), "0");
