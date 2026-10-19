@@ -1,6 +1,7 @@
-//! How long previews take, by source type, since the server started: what `wirephoto status` shows.
+//! How long previews take, by source type, and how each size was served, since the server started: what
+//! `wirephoto status` shows. The timings also serve for requests ([`crate::metrics`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -23,6 +24,31 @@ pub struct Stats {
     by_type: Mutex<HashMap<String, PerType>>,
     pub served_memory: AtomicU64,
     pub served_disk: AtomicU64,
+    by_size: Mutex<BTreeMap<u32, [u64; 5]>>,
+}
+
+/// Where a preview a request asked for came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Served {
+    Memory = 0,
+    Disk = 1,
+    /// Made from the cached 640.
+    FromCached = 2,
+    /// Decoded from the original.
+    Rendered = 3,
+    /// `cached=only` and there was none.
+    NotCached = 4,
+}
+
+/// One size's counts, as `wirephoto status` prints them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SizeServed {
+    pub size: u32,
+    pub memory: u64,
+    pub disk: u64,
+    pub from_cached: u64,
+    pub rendered: u64,
+    pub not_cached: u64,
 }
 
 /// One type's timings, as `wirephoto status` prints them.
@@ -73,6 +99,31 @@ impl Stats {
             .collect();
         out.sort_by_key(|t| std::cmp::Reverse(t.count));
         out
+    }
+
+    /// A preview of `size` served (or not) from `how`.
+    pub fn served_at(&self, size: u32, how: Served) {
+        match how {
+            Served::Memory => self.served_memory.fetch_add(1, Ordering::Relaxed),
+            Served::Disk => self.served_disk.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        self.by_size.lock().entry(size).or_default()[how as usize] += 1;
+    }
+
+    pub fn by_size(&self) -> Vec<SizeServed> {
+        self.by_size
+            .lock()
+            .iter()
+            .map(|(&size, c)| SizeServed {
+                size,
+                memory: c[0],
+                disk: c[1],
+                from_cached: c[2],
+                rendered: c[3],
+                not_cached: c[4],
+            })
+            .collect()
     }
 
     pub fn served(&self) -> (u64, u64) {

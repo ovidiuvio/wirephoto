@@ -281,7 +281,18 @@ pub fn sync_paths(app: &App, lib: &Library, dirs: HashSet<String>) -> anyhow::Re
             p = fsx::parent_of(p);
         }
     }
-    walk(app, lib, start, false)
+    relist(app, lib, start)
+}
+
+/// Lists folders again for changes made on disk, and notes when one changed the index (`wirephoto status`).
+fn relist(app: &App, lib: &Library, folders: Vec<Pending>) -> anyhow::Result<()> {
+    crate::metrics::Metrics::add(&app.metrics.folders_relisted, folders.len() as u64);
+    let before = *app.seq.borrow();
+    walk(app, lib, folders, false)?;
+    if *app.seq.borrow() != before {
+        app.metrics.disk_changed();
+    }
+    Ok(())
 }
 
 fn poll(app: &App, lib: &Library) -> anyhow::Result<()> {
@@ -304,7 +315,7 @@ fn poll(app: &App, lib: &Library) -> anyhow::Result<()> {
     if changed.is_empty() {
         return Ok(());
     }
-    walk(app, lib, changed, false)
+    relist(app, lib, changed)
 }
 
 /// Whether a filesystem event may mean a change. Opening something, or closing it after only reading, does not:
@@ -470,6 +481,7 @@ pub fn watch(app: Arc<App>, lib: Arc<Library>, watching: Watching) {
             let mut take = |ev: notify::Result<notify::Event>, dirs: &mut HashSet<String>| match ev
             {
                 Ok(ev) => {
+                    crate::metrics::Metrics::add(&app.metrics.fs_events, 1);
                     if ev.need_rescan() {
                         overflow = true;
                     }
@@ -1187,11 +1199,36 @@ pub async fn report(app: Arc<App>) {
     // The status last saved (without its time): saved again only when it changes, so an idle server leaves
     // the disks alone.
     let mut saved: Option<Vec<u8>> = None;
+    // What each library holds, and the cache by size: recounted, like the progress, only after a change.
+    let mut contents: HashMap<String, Contents> = HashMap::new();
+    let mut cache_sizes: (Option<u64>, Vec<CacheSize>) = (None, Vec::new());
     loop {
         tokio::time::sleep(EVERY).await;
         let writes = app.writes();
         let recount = counted_after != Some(writes);
         counted_after = Some(writes);
+        if recount {
+            for lib in &app.libraries {
+                match library_contents(&app, &lib.api_id) {
+                    Ok(c) => {
+                        contents.insert(lib.api_id.clone(), c);
+                    }
+                    Err(e) => tracing::debug!("counting {}: {e:#}", lib.api_id),
+                }
+            }
+        }
+        let disk = app.previews.disk().clone();
+        if cache_sizes.0 != Some(disk.changes()) {
+            let changes = disk.changes();
+            if let Ok(Ok(v)) = tokio::task::spawn_blocking(move || disk.by_size()).await {
+                cache_sizes = (
+                    Some(changes),
+                    v.into_iter()
+                        .map(|(size, count, bytes)| CacheSize { size, count, bytes })
+                        .collect(),
+                );
+            }
+        }
         let mut lines: Vec<(String, String)> = Vec::new();
         for lib in &app.libraries {
             let id = lib.api_id.clone();
@@ -1344,7 +1381,7 @@ pub async fn report(app: Arc<App>) {
             }
             last.insert(id, (now, busy, 0));
         }
-        let mut snapshot = status_snapshot(&app, started, lines);
+        let mut snapshot = status_snapshot(&app, started, lines, &contents, &cache_sizes.1);
         let time = std::mem::take(&mut snapshot.time);
         let Ok(unchanged) = serde_json::to_vec(&snapshot) else {
             continue;
@@ -1380,6 +1417,27 @@ pub struct Snapshot {
     /// The GPU: what it decodes, or why it is not used.
     #[serde(default)]
     pub gpu: String,
+    /// Images decoded on the GPU, and ones it failed on (decoded on the CPU instead).
+    #[serde(default)]
+    pub gpu_decoded: u64,
+    #[serde(default)]
+    pub gpu_fell_back: u64,
+    /// The server's process, for `wirephoto status` to read its CPU and memory itself.
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub requests: Vec<crate::metrics::RequestKind>,
+    #[serde(default)]
+    pub previews_by_size: Vec<crate::preview::stats::SizeServed>,
+    #[serde(default)]
+    pub cache_sizes: Vec<CacheSize>,
+    /// Previews in memory, their bytes, and the memory allowed.
+    #[serde(default)]
+    pub memory_cache: (u64, u64, u64),
+    #[serde(default)]
+    pub uploads: UploadCounts,
+    #[serde(default)]
+    pub disk_watch: DiskWatch,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1390,9 +1448,108 @@ pub struct LibraryStatus {
     pub watching: bool,
     pub poll_seconds: u64,
     pub progress: String,
+    #[serde(default)]
+    pub contents: Option<Contents>,
 }
 
-fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Snapshot {
+/// What a library holds (`wirephoto status`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Contents {
+    pub folders: u64,
+    pub images: u64,
+    pub raws: u64,
+    pub videos: u64,
+    pub others: u64,
+    /// Of every file not in the trash.
+    pub bytes: u64,
+    pub trash_files: u64,
+    pub trash_bytes: u64,
+    /// Sets of files with the same bytes, the copies beyond the first, and the space those take.
+    pub duplicate_sets: u64,
+    pub duplicate_copies: u64,
+    pub duplicate_bytes: u64,
+}
+
+/// Previews in the disk cache of one size.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CacheSize {
+    pub size: u32,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// Upload sessions (`wirephoto status`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UploadCounts {
+    pub open: u64,
+    pub opened: u64,
+    pub completed: u64,
+    pub abandoned: u64,
+    pub expired: u64,
+    /// Bytes received for files, single PUTs and chunks, since start.
+    pub bytes: u64,
+}
+
+/// Changes on disk seen while running (`wirephoto status`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiskWatch {
+    pub events: u64,
+    pub folders_relisted: u64,
+    /// Unix seconds; 0: none yet.
+    pub last_change: i64,
+}
+
+fn library_contents(app: &App, lib: &str) -> anyhow::Result<Contents> {
+    app.db.read(|c| {
+        let mut out = c.query_row(
+            "SELECT COALESCE(SUM(kind = 0), 0), COALESCE(SUM(kind = 1), 0), COALESCE(SUM(kind = 2), 0),
+                    COALESCE(SUM(kind = 3), 0), COALESCE(SUM(kind = 4), 0),
+                    COALESCE(SUM(CASE WHEN kind != 0 THEN size ELSE 0 END), 0)
+             FROM entries WHERE library = ? AND trashed_at IS NULL AND missing = 0",
+            [lib],
+            |r| {
+                Ok(Contents {
+                    folders: r.get::<_, i64>(0)? as u64,
+                    images: r.get::<_, i64>(1)? as u64,
+                    raws: r.get::<_, i64>(2)? as u64,
+                    videos: r.get::<_, i64>(3)? as u64,
+                    others: r.get::<_, i64>(4)? as u64,
+                    bytes: r.get::<_, i64>(5)? as u64,
+                    ..Contents::default()
+                })
+            },
+        )?;
+        (out.trash_files, out.trash_bytes) = c.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM entries
+             WHERE library = ? AND trashed_at IS NOT NULL AND kind != 0",
+            [lib],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?;
+        (out.duplicate_sets, out.duplicate_copies, out.duplicate_bytes) = c.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(n - 1), 0), COALESCE(SUM((n - 1) * size), 0) FROM (
+                 SELECT COUNT(*) AS n, MAX(size) AS size FROM entries
+                 WHERE library = ? AND sha256 IS NOT NULL AND kind != 0 AND trashed_at IS NULL AND missing = 0
+                 GROUP BY sha256 HAVING COUNT(*) > 1)",
+            [lib],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )?;
+        Ok(out)
+    })
+}
+
+fn status_snapshot(
+    app: &App,
+    started: i64,
+    lines: Vec<(String, String)>,
+    contents: &HashMap<String, Contents>,
+    cache_sizes: &[CacheSize],
+) -> Snapshot {
     let p = &app.previews;
     let (served_memory, served_disk) = p.stats.served();
     let (a, b) = (p.pool().stats(), p.bg_pool().stats());
@@ -1415,6 +1572,7 @@ fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Sna
                     .find(|(id, _)| *id == l.api_id)
                     .map(|(_, line)| line.clone())
                     .unwrap_or_default(),
+                contents: contents.get(&l.api_id).cloned(),
             })
             .collect(),
         times: p.stats.times(),
@@ -1428,6 +1586,42 @@ fn status_snapshot(app: &App, started: i64, lines: Vec<(String, String)>) -> Sna
         workers_started,
         workers_lost,
         gpu: p.pool().gpu().status(),
+        gpu_decoded: p.pool().gpu().decoded.load(Ordering::Relaxed),
+        gpu_fell_back: p.pool().gpu().fell_back.load(Ordering::Relaxed),
+        pid: std::process::id(),
+        requests: app.metrics.requests(),
+        previews_by_size: p.stats.by_size(),
+        cache_sizes: cache_sizes.to_vec(),
+        memory_cache: {
+            let (n, b) = p.memory();
+            (n, b, app.config.cache.memory)
+        },
+        uploads: {
+            use crate::metrics::Metrics;
+            let m = &app.metrics;
+            UploadCounts {
+                open: app
+                    .db
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT COUNT(*) FROM uploads WHERE expires > ?",
+                            [crate::util::now_secs()],
+                            |r| r.get::<_, i64>(0),
+                        )?)
+                    })
+                    .unwrap_or(0) as u64,
+                opened: Metrics::get(&m.uploads_opened),
+                completed: Metrics::get(&m.uploads_completed),
+                abandoned: Metrics::get(&m.uploads_abandoned),
+                expired: Metrics::get(&m.uploads_expired),
+                bytes: Metrics::get(&m.upload_bytes),
+            }
+        },
+        disk_watch: DiskWatch {
+            events: crate::metrics::Metrics::get(&app.metrics.fs_events),
+            folders_relisted: crate::metrics::Metrics::get(&app.metrics.folders_relisted),
+            last_change: app.metrics.last_disk_change.load(Ordering::Relaxed),
+        },
     }
 }
 

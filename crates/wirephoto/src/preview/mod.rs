@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
+
+use stats::Served;
 use wirephoto_api::Kind;
 
 use crate::db::EntryRow;
@@ -151,6 +153,11 @@ impl Previews {
         }
     }
 
+    /// Previews in memory, and their bytes.
+    pub fn memory(&self) -> (u64, u64) {
+        (self.mem.entry_count(), self.mem.weighted_size())
+    }
+
     pub fn disk(&self) -> &Arc<cache::DiskCache> {
         &self.disk
     }
@@ -169,11 +176,22 @@ impl Previews {
         self.renders.load(Ordering::Relaxed)
     }
 
-    /// A cached preview, without rendering.
+    /// A cached preview, without rendering, counted as served (`wirephoto status`).
     pub async fn cached(&self, key: &str) -> Option<Bytes> {
+        let size = key
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let (b, from) = self.lookup(key).await?;
+        self.stats.served_at(size, from);
+        Some(b)
+    }
+
+    /// A cached preview from memory or the disk, not counted (what other sizes are made from).
+    async fn lookup(&self, key: &str) -> Option<(Bytes, Served)> {
         if let Some(b) = self.mem.get(key).await {
-            self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
-            return Some(b);
+            return Some((b, Served::Memory));
         }
         let disk = self.disk.clone();
         let k = key.to_string();
@@ -182,9 +200,8 @@ impl Previews {
             .ok()?
             .ok()??;
         let b = Bytes::from(found);
-        self.stats.served_disk.fetch_add(1, Ordering::Relaxed);
         self.mem.insert(key.to_string(), b.clone()).await;
-        Some(b)
+        Some((b, Served::Disk))
     }
 
     /// The preview of `entry` at `size`, rendering it if needed.
@@ -199,7 +216,7 @@ impl Previews {
         let hit = if size < CACHED_SIZE {
             let b = self.mem.get(&k).await;
             if b.is_some() {
-                self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
+                self.stats.served_at(size, Served::Memory);
             }
             b
         } else {
@@ -234,6 +251,14 @@ impl Previews {
         } else {
             self.render_cached(entry, src, size).await?
         };
+        self.stats.served_at(
+            size,
+            if size < CACHED_SIZE {
+                Served::FromCached
+            } else {
+                Served::Rendered
+            },
+        );
         Ok((
             bytes,
             Timing {
@@ -251,7 +276,7 @@ impl Previews {
         size: u32,
     ) -> anyhow::Result<Bytes> {
         let k = key(entry, size);
-        if let Some(b) = self.cached(&k).await {
+        if let Some((b, _)) = self.lookup(&k).await {
             return Ok(b);
         }
         let job = self.job(entry, src, size, &k, self.pool.clone());
@@ -297,19 +322,27 @@ impl Previews {
     /// (about a millisecond).
     pub async fn get_cached(&self, entry: &EntryRow, size: u32) -> Option<Bytes> {
         if size >= CACHED_SIZE {
-            return self.cached(&key(entry, size)).await;
+            let b = self.cached(&key(entry, size)).await;
+            if b.is_none() {
+                self.stats.served_at(size, Served::NotCached);
+            }
+            return b;
         }
         let k = key(entry, size);
         if let Some(b) = self.mem.get(&k).await {
-            self.stats.served_memory.fetch_add(1, Ordering::Relaxed);
+            self.stats.served_at(size, Served::Memory);
             return Some(b);
         }
-        let base = self.cached(&key(entry, CACHED_SIZE)).await?;
+        let Some((base, _)) = self.lookup(&key(entry, CACHED_SIZE)).await else {
+            self.stats.served_at(size, Served::NotCached);
+            return None;
+        };
         let out = tokio::task::spawn_blocking(move || shrink(&base, size))
             .await
             .ok()?
             .ok()?;
         let b = Bytes::from(out);
+        self.stats.served_at(size, Served::FromCached);
         self.mem.insert(k, b.clone()).await;
         Some(b)
     }

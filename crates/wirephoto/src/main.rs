@@ -532,6 +532,7 @@ fn cache(config: Config, command: CacheCommand) -> anyhow::Result<()> {
 
 fn human(bytes: u64) -> String {
     match bytes {
+        b if b >= 1 << 40 => format!("{:.1} TB", b as f64 / (1u64 << 40) as f64),
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
@@ -669,6 +670,7 @@ fn audit(
 }
 
 fn status(config: &Config) -> anyhow::Result<()> {
+    use wirephoto::resources;
     let db = open_db(config)?;
     let Some(raw) = db.meta_get("status")? else {
         println!("No status yet: the server is not running, or started less than 30 seconds ago.");
@@ -684,9 +686,18 @@ fn status(config: &Config) -> anyhow::Result<()> {
         match m {
             0 => format!("{secs} s"),
             1..=59 => format!("{m} min"),
-            _ => format!("{} h {:02} min", m / 60, m % 60),
+            _ if m < 48 * 60 => format!("{} h {:02} min", m / 60, m % 60),
+            _ => format!("{} days {} h", m / 1440, m % 1440 / 60),
         }
     };
+    let ms = |v: u64| {
+        if v >= 1000 {
+            format!("{:.2} s", v as f64 / 1000.0)
+        } else {
+            format!("{v} ms")
+        }
+    };
+    let n = |v: u64| thousands(v);
     let up = if running { now } else { s.time } - s.started;
     println!("wirephoto {}, up {}", s.version, words(up));
     if wirephoto::indexer::paused_in(&db) {
@@ -698,6 +709,42 @@ fn status(config: &Config) -> anyhow::Result<()> {
             words(ago)
         );
     }
+
+    // What it uses now: read here, from the server's process and the disks.
+    if running && let Some((a_srv, a_kids, _)) = resources::of_server(s.pid) {
+        let gap = std::time::Duration::from_millis(500);
+        std::thread::sleep(gap);
+        if let Some((b_srv, b_kids, kids)) = resources::of_server(s.pid) {
+            let pct = |a: f64, b: f64| (b - a).max(0.0) / gap.as_secs_f64() * 100.0;
+            println!(
+                "  CPU now: server {:.1}%, decode workers {:.1}% ({kids} running); used since start {}",
+                pct(a_srv.cpu_secs, b_srv.cpu_secs),
+                pct(a_kids.cpu_secs, b_kids.cpu_secs),
+                words((b_srv.cpu_secs + b_kids.cpu_secs).round() as i64)
+            );
+            println!(
+                "  Memory: server {}, decode workers {}",
+                human(b_srv.rss),
+                human(b_kids.rss)
+            );
+        }
+    }
+    let size_of = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let index = size_of(&config.data.join("index.db")) + size_of(&config.data.join("index.db-wal"));
+    let cache_file = size_of(&config.data.join("previews.redb"));
+    let free = |p: &std::path::Path| {
+        resources::disk(p)
+            .map(|(f, t)| format!("{} free of {}", human(f), human(t)))
+            .unwrap_or_else(|| "free space unknown".into())
+    };
+    println!(
+        "  Data {}: {} (index {}, preview cache file {})",
+        config.data.display(),
+        free(&config.data),
+        human(index),
+        human(cache_file)
+    );
+
     for l in &s.libraries {
         let watch = if l.watching {
             "watching for changes".to_string()
@@ -706,27 +753,96 @@ fn status(config: &Config) -> anyhow::Result<()> {
         };
         println!("\n{} \"{}\" ({}), {watch}", l.id, l.name, l.path);
         println!("  {}", l.progress);
-    }
-    let ms = |v: u64| {
-        if v >= 1000 {
-            format!("{:.2} s", v as f64 / 1000.0)
-        } else {
-            format!("{v} ms")
+        if let Some(c) = &l.contents {
+            println!(
+                "  holds {} photos, {} RAW, {} videos, {} other files in {} folders: {}",
+                n(c.images),
+                n(c.raws),
+                n(c.videos),
+                n(c.others),
+                n(c.folders),
+                human(c.bytes)
+            );
+            println!(
+                "  trash: {} files, {}; duplicates: {} sets, {} extra copies, {}",
+                n(c.trash_files),
+                human(c.trash_bytes),
+                n(c.duplicate_sets),
+                n(c.duplicate_copies),
+                human(c.duplicate_bytes)
+            );
         }
+        println!("  disk: {}", free(std::path::Path::new(&l.path)));
+    }
+    let w = &s.disk_watch;
+    let last = if w.last_change > 0 {
+        format!("last change {} ago", words(now - w.last_change))
+    } else {
+        "none yet".into()
     };
+    println!(
+        "\nChanges on disk since start: {last}; {} events, {} folders listed again",
+        n(w.events),
+        n(w.folders_relisted)
+    );
+
+    println!("\nRequests since start (time to the response's start):");
+    if s.requests.is_empty() {
+        println!("  none yet");
+    } else {
+        println!(
+            "  {:<15} {:>8} {:>6} {:>6} {:>10} {:>9} {:>9} {:>9}",
+            "kind", "count", "4xx", "5xx", "sent", "median", "95%", "slowest"
+        );
+        for r in &s.requests {
+            println!(
+                "  {:<15} {:>8} {:>6} {:>6} {:>10} {:>9} {:>9} {:>9}",
+                r.kind,
+                n(r.count),
+                n(r.client_errors),
+                n(r.server_errors),
+                human(r.bytes),
+                ms(r.p50_ms),
+                ms(r.p95_ms),
+                ms(r.max_ms)
+            );
+        }
+    }
+
+    println!("\nPreviews asked for since start, by size:");
+    if s.previews_by_size.is_empty() {
+        println!("  none yet");
+    } else {
+        println!(
+            "  {:<7} {:>9} {:>9} {:>10} {:>10} {:>11}",
+            "size", "memory", "disk", "from 640", "rendered", "not cached"
+        );
+        for p in &s.previews_by_size {
+            println!(
+                "  {:<7} {:>9} {:>9} {:>10} {:>10} {:>11}",
+                p.size,
+                n(p.memory),
+                n(p.disk),
+                n(p.from_cached),
+                n(p.rendered),
+                n(p.not_cached)
+            );
+        }
+    }
+
     println!("\nPreviews made since start, time each:");
     if s.times.is_empty() {
         println!("  none yet");
     } else {
         println!(
-            "  {:<14} {:>8} {:>9} {:>9} {:>9} {:>9}",
+            "  {:<16} {:>8} {:>9} {:>9} {:>9} {:>9}",
             "from", "count", "mean", "median", "95%", "slowest"
         );
         for t in &s.times {
             println!(
-                "  {:<14} {:>8} {:>9} {:>9} {:>9} {:>9}",
+                "  {:<16} {:>8} {:>9} {:>9} {:>9} {:>9}",
                 t.kind,
-                t.count,
+                n(t.count),
                 ms(t.mean_ms),
                 ms(t.p50_ms),
                 ms(t.p95_ms),
@@ -734,14 +850,26 @@ fn status(config: &Config) -> anyhow::Result<()> {
             );
         }
     }
+
     println!(
-        "\nPreviews served: {} from memory, {} from the disk cache, {} rendered from originals",
-        s.served_memory, s.served_disk, s.rendered
-    );
-    println!(
-        "Preview cache: {} of {}",
+        "\nPreview cache: {} of {}",
         human(s.cache_bytes),
         human(s.cache_budget)
+    );
+    for c in &s.cache_sizes {
+        println!(
+            "  {:>4} px  {:>10} previews  {:>10}",
+            c.size,
+            n(c.count),
+            human(c.bytes)
+        );
+    }
+    let (m_n, m_b, m_cap) = s.memory_cache;
+    println!(
+        "Memory cache: {} previews, {} of {}",
+        n(m_n),
+        human(m_b),
+        human(m_cap)
     );
     println!(
         "Decode workers: {} at once ({} for pre-generation); {} started, {} lost",
@@ -749,6 +877,36 @@ fn status(config: &Config) -> anyhow::Result<()> {
     );
     if !s.gpu.is_empty() {
         println!("GPU: {}", s.gpu);
+        if s.gpu_decoded + s.gpu_fell_back > 0 {
+            println!(
+                "  {} images decoded on it, {} it failed on (decoded on the CPU)",
+                n(s.gpu_decoded),
+                n(s.gpu_fell_back)
+            );
+        }
     }
+    let u = &s.uploads;
+    println!(
+        "Uploads: {} sessions open; since start {} opened, {} completed, {} abandoned, {} expired; {} received",
+        n(u.open),
+        n(u.opened),
+        n(u.completed),
+        n(u.abandoned),
+        n(u.expired),
+        human(u.bytes)
+    );
     Ok(())
+}
+
+/// 1234567 -> "1,234,567".
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }

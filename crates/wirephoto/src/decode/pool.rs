@@ -36,6 +36,9 @@ pub struct GpuState {
     /// What `wirephoto status` says about the GPU.
     status: parking_lot::RwLock<String>,
     in_a_row: AtomicU64,
+    /// Images decoded on the GPU, and ones it failed on (decoded on the CPU instead), since start.
+    pub decoded: AtomicU64,
+    pub fell_back: AtomicU64,
     /// Workers are started able to open the GPU (their sandbox lets them open its render node read-write).
     pub allow: bool,
 }
@@ -49,6 +52,8 @@ impl GpuState {
             }),
             status: parking_lot::RwLock::new(status),
             in_a_row: AtomicU64::new(0),
+            decoded: AtomicU64::new(0),
+            fell_back: AtomicU64::new(0),
             allow,
         }
     }
@@ -73,6 +78,7 @@ impl GpuState {
 
     fn record(&self, made: u8) {
         if made & how::GPU_FAILED != 0 {
+            self.fell_back.fetch_add(1, Ordering::Relaxed);
             let n = self.in_a_row.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= GPU_GIVE_UP && self.accel.read().gpu.is_some() {
                 self.accel.write().gpu = None;
@@ -82,6 +88,7 @@ impl GpuState {
                 *self.status.write() = why;
             }
         } else if made & !how::GPU_FAILED == how::GPU {
+            self.decoded.fetch_add(1, Ordering::Relaxed);
             self.in_a_row.store(0, Ordering::Relaxed);
         }
     }

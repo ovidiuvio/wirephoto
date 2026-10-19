@@ -86,6 +86,8 @@ pub struct App {
     pub yielding: std::sync::atomic::AtomicBool,
     /// Index writes so far ([`App::write`]): progress is counted again only after one.
     pub writes: AtomicU64,
+    /// Requests, uploads and changes on disk since start (`wirephoto status`).
+    pub metrics: crate::metrics::Metrics,
 }
 
 impl App {

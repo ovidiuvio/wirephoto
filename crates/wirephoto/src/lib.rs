@@ -11,7 +11,9 @@ pub mod http;
 pub mod indexer;
 pub mod kind;
 pub mod media;
+pub mod metrics;
 pub mod preview;
+pub mod resources;
 pub mod uploads;
 pub mod util;
 pub mod write;
@@ -152,6 +154,7 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
         api_activity: std::sync::atomic::AtomicI64::new(0),
         yielding: std::sync::atomic::AtomicBool::new(false),
         writes: std::sync::atomic::AtomicU64::new(0),
+        metrics: Default::default(),
     });
     // The root IDs of libraries indexed before, so they are known before the scan finishes.
     for lib in &app.libraries {

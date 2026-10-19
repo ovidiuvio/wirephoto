@@ -42,7 +42,7 @@ Keeping an eye on it (all run where the server runs, e.g. `docker compose exec w
 
 | Command | |
 |---|---|
-| `wirephoto status` | Each library's progress, speed and time left; how long previews take by file type; cache and workers |
+| `wirephoto status` | Each library's progress, speed and time left, contents, trash and duplicates; requests by kind (count, errors, bytes, times); previews by size and where they came from; render times by file type and decoder; cache by size; CPU, memory and free disk; GPU, workers, uploads, changes on disk |
 | `wirephoto audit [--since 7d] [--key NAME] [--op OP]` | The audit trail: uploads, moves, deletes, restores, refused requests, key changes |
 | `wirephoto pause` / `resume` | Hold background work (reading files, previews, hashing), also across restarts |
 | `wirephoto cache stats\|list\|extract DIR` | Look inside the preview cache |

@@ -21,6 +21,8 @@ pub struct DiskCache {
     max_bytes: u64,
     total: AtomicU64,
     dirty: AtomicBool,
+    /// Bumped by every change, so figures about the cache are recomputed only after one.
+    changes: AtomicU64,
     /// The size kept longest (evicted after every other size).
     keep_size: u32,
 }
@@ -55,6 +57,7 @@ impl DiskCache {
             max_bytes,
             total: AtomicU64::new(total),
             dirty: AtomicBool::new(false),
+            changes: AtomicU64::new(0),
             keep_size,
         })
     }
@@ -91,6 +94,7 @@ impl DiskCache {
             .insert(key, (len, crate::util::now_secs() as u64))?;
         w.commit()?;
         self.dirty.store(true, Ordering::Relaxed);
+        self.changes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -111,6 +115,7 @@ impl DiskCache {
             self.total.fetch_sub(old, Ordering::Relaxed);
         }
         self.dirty.store(true, Ordering::Relaxed);
+        self.changes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -143,6 +148,7 @@ impl DiskCache {
         if changed {
             self.total.fetch_sub(freed, Ordering::Relaxed);
             self.dirty.store(true, Ordering::Relaxed);
+            self.changes.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -190,11 +196,31 @@ impl DiskCache {
                 w.commit()?;
                 let bytes: u64 = gone.iter().map(|g| g.1).sum();
                 self.total.fetch_sub(bytes, Ordering::Relaxed);
+                self.changes.fetch_add(1, Ordering::Relaxed);
                 removed += gone.len() as u64;
             }
             after = Some(last);
         }
         Ok(removed)
+    }
+
+    /// How many changes there have been (see `changes`).
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Relaxed)
+    }
+
+    /// Previews and bytes by size, smallest size first (reads every key: call it after a change only).
+    pub fn by_size(&self) -> anyhow::Result<Vec<(u32, u64, u64)>> {
+        let r = self.db.begin_read()?;
+        let meta = r.open_table(META)?;
+        let mut by: std::collections::BTreeMap<u32, (u64, u64)> = Default::default();
+        for item in meta.iter()? {
+            let (k, m) = item?;
+            let e = by.entry(size_of_key(k.value())).or_default();
+            e.0 += 1;
+            e.1 += m.value().0;
+        }
+        Ok(by.into_iter().map(|(s, (n, b))| (s, n, b)).collect())
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -252,6 +278,7 @@ impl DiskCache {
         w.set_quick_repair(true);
         w.commit()?;
         self.total.fetch_sub(freed, Ordering::Relaxed);
+        self.changes.fetch_add(1, Ordering::Relaxed);
         Ok(freed)
     }
 }

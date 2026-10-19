@@ -293,6 +293,9 @@ async fn save_new(
     let lib = writable(&app, &key, &parent)?;
     let wanted = fsx::join(&parent.path, &name);
     let (tmp, sha, kept) = receive(&lib, &wanted, body).await?;
+    if let Ok(Some(st)) = lib.fs.stat(&tmp) {
+        crate::metrics::Metrics::add(&app.metrics.upload_bytes, st.size);
+    }
     if digest.is_some_and(|d| d != sha) {
         let _ = lib.fs.remove_file(&tmp);
         return Err(ApiError::digest_mismatch());

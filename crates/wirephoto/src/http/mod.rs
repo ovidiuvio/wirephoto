@@ -180,16 +180,21 @@ async fn access_log(
     }
     let status = res.status().as_u16();
     let ms = started.elapsed().as_millis() as u64;
+    // A whole body knows its length; a stream (batches, live changes) does not yet.
+    let bytes = res
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| axum::body::HttpBody::size_hint(res.body()).exact());
+    app.metrics.request(
+        crate::metrics::kind_of(method.as_str(), &path),
+        status,
+        bytes,
+        ms,
+    );
     if app.config.log.access {
-        // A whole body knows its length; a stream (downloads, batches, live changes) does not yet.
-        let size = res
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .or_else(|| axum::body::HttpBody::size_hint(res.body()).exact())
-            .map(human_bytes)
-            .unwrap_or_else(|| "-".into());
+        let size = bytes.map(human_bytes).unwrap_or_else(|| "-".into());
         tracing::info!(
             target: "wirephoto::access",
             "{method} {path} {status} {ms} ms {size} key={} client={}",

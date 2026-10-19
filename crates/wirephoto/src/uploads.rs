@@ -215,6 +215,7 @@ pub async fn create(
             )?;
             Ok(())
         })?;
+        crate::metrics::Metrics::add(&app.metrics.uploads_opened, 1);
         let mut r = (StatusCode::CREATED, Json(upload_json(&s))).into_response();
         r.headers_mut().insert(
             header::LOCATION,
@@ -297,6 +298,7 @@ pub async fn put_chunk(
     }
     // On disk before it counts as received: a restart resumes from what is really there.
     file.sync_data().await?;
+    crate::metrics::Metrics::add(&app.metrics.upload_bytes, got);
     blocking(move || {
         let received = app.db.write(|t| {
             let Some(cur) = session(t, &id)?.filter(|s| s.state == OPEN) else {
@@ -425,6 +427,9 @@ pub async fn complete(
     .await;
     let id = s.id.clone();
     let stored = res.is_ok();
+    if stored {
+        crate::metrics::Metrics::add(&app.metrics.uploads_completed, 1);
+    }
     blocking(move || {
         if stored {
             app.db.write(|t| {
@@ -459,6 +464,7 @@ pub async fn abandon(
             return Err(ApiError::conflict("the upload is being completed"));
         }
         drop_session(&app, &lib, &s.id)?;
+        crate::metrics::Metrics::add(&app.metrics.uploads_abandoned, 1);
         Ok(StatusCode::NO_CONTENT)
     })
     .await
@@ -496,6 +502,7 @@ pub fn purge(app: &App) -> anyhow::Result<usize> {
             }
         }
     }
+    crate::metrics::Metrics::add(&app.metrics.uploads_expired, expired.len() as u64);
     Ok(expired.len())
 }
 
