@@ -124,6 +124,22 @@ impl LibFs {
         Ok(self.dir.open(p(rel))?.into_std())
     }
 
+    /// A new, empty file, failing if `rel` exists.
+    pub fn create_new(&self, rel: &str) -> io::Result<std::fs::File> {
+        Ok(self
+            .dir
+            .open_with(p(rel), OpenOptions::new().write(true).create_new(true))?
+            .into_std())
+    }
+
+    /// An existing file opened for writing in place (never created, never truncated).
+    pub fn open_write(&self, rel: &str) -> io::Result<std::fs::File> {
+        Ok(self
+            .dir
+            .open_with(p(rel), OpenOptions::new().write(true))?
+            .into_std())
+    }
+
     /// Up to `n` bytes from the start of a file.
     pub fn read_head(&self, rel: &str, n: usize) -> io::Result<Vec<u8>> {
         let mut f = self.open_file(rel)?;

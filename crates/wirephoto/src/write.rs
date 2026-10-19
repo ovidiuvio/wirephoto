@@ -26,7 +26,11 @@ use crate::{indexer, media, preview, util};
 /// flight instead of a read back from disk.
 const KEEP_IN_MEMORY: usize = 256 << 20;
 
-fn writable(app: &App, key: &crate::auth::KeyRow, row: &EntryRow) -> ApiResult<Arc<Library>> {
+pub(crate) fn writable(
+    app: &App,
+    key: &crate::auth::KeyRow,
+    row: &EntryRow,
+) -> ApiResult<Arc<Library>> {
     if key.scope != wirephoto_api::Scope::Write {
         return Err(ApiError::forbidden("this key is read-only"));
     }
@@ -53,7 +57,7 @@ fn check_if_match(headers: &HeaderMap, row: &EntryRow) -> ApiResult<()> {
 }
 
 /// `Content-Digest: sha-256=:<base64>:` -> the 32 bytes.
-fn content_digest(headers: &HeaderMap) -> ApiResult<Option<Vec<u8>>> {
+pub(crate) fn content_digest(headers: &HeaderMap) -> ApiResult<Option<Vec<u8>>> {
     let Some(v) = headers.get("content-digest") else {
         return Ok(None);
     };
@@ -192,7 +196,7 @@ fn first_free(
 
 /// A file in `folder` with exactly these bytes. Files of the same size not hashed yet are hashed now, so the
 /// check cannot miss one.
-fn same_content(
+pub(crate) fn same_content(
     app: &App,
     folder: &EntryRow,
     size: u64,
@@ -285,7 +289,6 @@ async fn save_new(
         return Err(ApiError::invalid("parent is not a folder"));
     }
     let started = std::time::Instant::now();
-    let asked = name.clone();
     let digest = content_digest(&headers)?;
     let lib = writable(&app, &key, &parent)?;
     let wanted = fsx::join(&parent.path, &name);
@@ -294,6 +297,26 @@ async fn save_new(
         let _ = lib.fs.remove_file(&tmp);
         return Err(ApiError::digest_mismatch());
     }
+    store_new(app, key, info, parent, name, lib, tmp, sha, kept, started).await
+}
+
+/// Stores a file received in full at `tmp` (in the library, hashed) into `parent` as `name`, as a `PUT` into
+/// the folder does: `200` with the file that already has these bytes (and `tmp` removed), else `201` with the
+/// new entry under `name` or the first free `name-N`. Never overwrites.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_new(
+    app: Arc<App>,
+    key: crate::auth::KeyRow,
+    info: Option<crate::audit::RequestInfo>,
+    parent: EntryRow,
+    name: String,
+    lib: Arc<Library>,
+    tmp: String,
+    sha: [u8; 32],
+    kept: Option<Vec<u8>>,
+    started: std::time::Instant,
+) -> ApiResult<Response> {
+    let asked = name.clone();
     let a = app.clone();
     let lib2 = lib.clone();
     let kept = kept.map(Arc::new);

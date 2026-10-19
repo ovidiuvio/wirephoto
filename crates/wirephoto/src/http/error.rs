@@ -85,6 +85,14 @@ impl ApiError {
         )
         .detail(d)
     }
+    pub fn incomplete(d: impl Into<String>) -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "incomplete",
+            "Not every byte of the upload has arrived",
+        )
+        .detail(d)
+    }
     pub fn too_large(d: impl Into<String>) -> ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "too-large", "Over a limit").detail(d)
     }

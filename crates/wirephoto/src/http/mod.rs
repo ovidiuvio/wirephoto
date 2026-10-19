@@ -35,6 +35,8 @@ async fn server_info(MaybeCaller(key): MaybeCaller) -> Json<ServerInfo> {
             page_size: entries::PAGE_MAX,
             batch: batch::MAX_BATCH as u32,
             previews: bytes::MAX_PREVIEWS as u32,
+            upload_chunk: crate::uploads::CHUNK,
+            upload_parallel: crate::uploads::PARALLEL,
         },
         key: key.map(|k| KeyInfo {
             name: k.name,
@@ -284,6 +286,14 @@ pub fn router(app: Arc<App>) -> Router {
             put(crate::write::put_child),
         )
         .route("/v1/previews", post(bytes::post_previews))
+        .route("/v1/uploads", post(crate::uploads::create))
+        .route(
+            "/v1/uploads/{id}",
+            get(crate::uploads::status)
+                .put(crate::uploads::put_chunk)
+                .delete(crate::uploads::abandon),
+        )
+        .route("/v1/uploads/{id}/complete", post(crate::uploads::complete))
         .route("/v1/batch", post(batch::post_batch))
         .route("/v1/changes", get(changes::get_changes))
         .fallback(|| async { error::ApiError::not_found() })

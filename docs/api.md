@@ -23,7 +23,7 @@ are in [design.md](design.md).
    fields, `DELETE` deletes. Paths are nouns.
 2. **JSON** for everything except file bytes and previews. Fields are `camelCase`, timestamps RFC 3339, sizes in
    bytes, durations in seconds. A field that does not apply is omitted.
-3. **IDs** are opaque strings: `lib_…` for libraries, `ent_…` for entries. An entry keeps its ID when it is
+3. **IDs** are opaque strings: `lib_…` for libraries, `ent_…` for entries, `upl_…` for upload sessions. An entry keeps its ID when it is
    renamed, moved or trashed. Clients never build IDs from paths.
 4. **URLs are given, not built.** Entries carry the URLs of their bytes and previews; clients use them as they
    are.
@@ -78,7 +78,7 @@ wirephoto keys revoke laptop-browser
   "name": "wirephoto",
   "version": "1.0.0",
   "previews": {"sizes": [160, 320, 480, 640, 1280, 2560]},
-  "limits": {"pageSize": 1000, "batch": 100, "previews": 500},
+  "limits": {"pageSize": 1000, "batch": 100, "previews": 500, "uploadChunk": 8388608, "uploadParallel": 4},
   "key": {"name": "laptop-browser", "scope": "write", "libraries": ["lib_nas"]}
 }
 ```
@@ -261,6 +261,52 @@ The request body is the file. Never refused for its name, and never overwrites a
 
 The file appears whole or not at all. `If-None-Match: *` is accepted and changes nothing.
 
+### Upload sessions — large files in chunks
+
+For a file larger than `limits.uploadChunk` (`GET /v1`): sent in chunks, several at once
+(`limits.uploadParallel`) and in any order, and resumable after a dropped connection or a reload. Once
+complete it is stored exactly like a `PUT` into the folder. A session belongs to the key that opened it (anyone
+else gets `404`), needs a `write` key and a library that is not read-only (`403`), and expires 48 hours after it
+was opened, with whatever it received.
+
+**`POST /v1/uploads`** opens one:
+
+```json
+{"parent": "ent_7c2e", "name": "DSC01234.ARW", "size": 61234567, "sha256": "9f86d0…"}
+```
+
+`sha256` (lowercase hex) is optional. When it is given and the folder already holds those bytes, nothing needs
+uploading: `200 {"entry": …}` with that file. Otherwise `201`, `Location: /v1/uploads/{id}`, and the session:
+
+```json
+{"id": "upl_Qm3x", "size": 61234567, "chunk": 8388608, "received": [], "expires": "2026-10-21T14:02:11Z"}
+```
+
+`received` lists the byte ranges stored so far as `[start, end)` pairs, merged and in order.
+
+**`PUT /v1/uploads/{id}`** stores one chunk. The body is the bytes;
+`Content-Range: bytes <first>-<last>/<size>` says where they go (`<size>` is the file's). Every chunk is at most
+`chunk` bytes; chunks may arrive in any order, at once, or again (a retry). An optional `Content-Digest` checks
+the chunk: a mismatch is `400 digest-mismatch` and the chunk is not counted. A chunk counts once it is on disk.
+`200`:
+
+```json
+{"received": [[0, 16777216], [58720256, 61234567]]}
+```
+
+**`GET /v1/uploads/{id}`** answers the session as above: to resume, send what `received` does not cover.
+
+**`POST /v1/uploads/{id}/complete`** stores the file once every byte has arrived (otherwise `409 incomplete`),
+checked against the `Content-Digest` header (whole file) or else the `sha256` given when opening; on a
+mismatch nothing is stored, the session is gone, and the answer is `400 digest-mismatch`. Then, as with `PUT`:
+`200` with the existing entry if the folder already holds these bytes, else `201` with the new entry under
+`name` or the next free name. The file appears whole or not at all; the session is gone after either.
+
+**`DELETE /v1/uploads/{id}`** abandons the session and its bytes: `204`.
+
+The server keeps the bytes in the library's own `.wp-uploads` folder (never listed), so completing moves them
+into place without copying.
+
 ### `PUT /v1/entries/{id}/content` — new contents for a file
 
 Saved as a **new file beside it**; the original is never overwritten. The same as a `PUT` into its folder
@@ -410,10 +456,11 @@ Apps act on `code`; `title` and `detail` are for people.
 | `unauthenticated` | 401 | Missing, unknown or revoked key; bad `sig` |
 | `forbidden` | 403 | Read-only key or library; key used from another origin |
 | `not-found` | 404 | No such entry or library |
-| `conflict` | 409 | Move across libraries; deleting what is in the trash; a folder into itself |
+| `conflict` | 409 | Move across libraries; deleting what is in the trash; a folder into itself; an upload being completed |
+| `incomplete` | 409 | Completing an upload before every byte has arrived |
 | `history-expired` | 410 | `since` is older than the kept history |
 | `version-mismatch` | 412 | `If-Match` failed (`PATCH`, `DELETE`) |
-| `too-large` | 413 | Over a limit (batch, previews) |
+| `too-large` | 413 | Over a limit (batch, previews, an upload chunk) |
 | `unsupported-media` | 415 | Cannot preview this file |
 | `not-cached` | 504 | `only-if-cached` and the preview is not made yet |
 | `preview-failed` | 503 | The preview could not be made this time (a decoder crashed, the file could not be opened); try again |
@@ -433,6 +480,9 @@ Apps act on `code`; `title` and `detail` are for people.
 | GET, PUT | `/v1/entries/{id}/content` | Read, replace bytes |
 | GET | `/v1/entries/{id}/preview/{size}.jpg` | One preview |
 | PUT | `/v1/entries/{folder}/children/{name}` | New file |
+| POST | `/v1/uploads` | Open an upload session (large files in chunks) |
+| GET, PUT, DELETE | `/v1/uploads/{id}` | Session state, one chunk, abandon |
+| POST | `/v1/uploads/{id}/complete` | Store the uploaded file |
 | POST | `/v1/previews` | Many previews, streamed |
 | POST | `/v1/batch` | Many requests in one |
 | GET | `/v1/changes` | Changes since, or live |

@@ -12,6 +12,7 @@ pub mod indexer;
 pub mod kind;
 pub mod media;
 pub mod preview;
+pub mod uploads;
 pub mod util;
 pub mod write;
 

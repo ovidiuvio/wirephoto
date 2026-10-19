@@ -1754,3 +1754,256 @@ async fn a_file_that_cannot_be_hashed_does_not_stop_the_others() {
     wirephoto::indexer::settle(&t.app).await.unwrap();
     assert!(row_at(&t, "2026/locked.jpg").unwrap().sha256.is_some());
 }
+
+/// Bytes that are not any image, `n` long.
+fn noise(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i as u32).wrapping_mul(2654435761).rotate_left(seed as u32) as u8)
+        .collect()
+}
+
+impl T {
+    async fn chunk(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        digest: Option<String>,
+    ) -> Res {
+        let mut req = self.req("PUT", &format!("/v1/uploads/{id}")).header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{}/{}", end - 1, bytes.len()),
+        );
+        if let Some(d) = digest {
+            req = req.header("content-digest", d);
+        }
+        self.send(req.body(Body::from(bytes[start..end].to_vec())).unwrap())
+            .await
+    }
+}
+
+fn sha_header(b: &[u8]) -> String {
+    format!("sha-256=:{}:", wirephoto::util::b64(&Sha256::digest(b)))
+}
+
+#[tokio::test]
+async fn upload_sessions_in_chunks_any_order() {
+    let t = setup().await;
+    let r = t.get("/v1").await;
+    assert_eq!(r.json()["limits"]["uploadChunk"], 8 << 20);
+    assert_eq!(r.json()["limits"]["uploadParallel"], 4);
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap();
+    let chunk = 8 << 20;
+    let bytes = noise(2 * chunk + 12345, 3);
+
+    let r = t
+        .json(
+            "POST",
+            "/v1/uploads",
+            json!({"parent": fid, "name": "big.raw", "size": bytes.len()}),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("upl_"));
+    assert_eq!(r.json()["received"], json!([]));
+    assert_eq!(r.header("location").unwrap(), format!("/v1/uploads/{id}"));
+
+    // Completing early: not everything is there.
+    let r = t
+        .json("POST", &format!("/v1/uploads/{id}/complete"), json!({}))
+        .await;
+    assert_eq!(
+        (r.status, r.json()["code"].clone()),
+        (StatusCode::CONFLICT, json!("incomplete"))
+    );
+
+    // The last chunk first, then the other two at once.
+    let r = t
+        .chunk(
+            &id,
+            &bytes,
+            2 * chunk,
+            bytes.len(),
+            Some(sha_header(&bytes[2 * chunk..])),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["received"], json!([[2 * chunk, bytes.len()]]));
+    // A chunk whose digest does not match is not kept.
+    let r = t
+        .chunk(&id, &bytes, 0, chunk, Some(sha_header(b"other")))
+        .await;
+    assert_eq!(r.json()["code"], "digest-mismatch");
+    let (a, b) = tokio::join!(
+        t.chunk(&id, &bytes, 0, chunk, None),
+        t.chunk(&id, &bytes, chunk, 2 * chunk, None)
+    );
+    assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
+    // Resuming: what is there.
+    let r = t.get(&format!("/v1/uploads/{id}")).await;
+    assert_eq!(r.json()["received"], json!([[0, bytes.len()]]));
+    // Over the chunk size, or a wrong total: refused.
+    let r = t
+        .send(
+            t.req("PUT", &format!("/v1/uploads/{id}"))
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes 0-0/{}", bytes.len() + 1),
+                )
+                .body(Body::from(vec![0u8]))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+
+    let r = t
+        .send(
+            t.req("POST", &format!("/v1/uploads/{id}/complete"))
+                .header("content-digest", sha_header(&bytes))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let e = r.json();
+    assert_eq!(e["name"], "big.raw");
+    assert_eq!(
+        e["sha256"].as_str().unwrap(),
+        hex::encode(Sha256::digest(&bytes))
+    );
+    assert_eq!(std::fs::read(t.lib.join("2026/big.raw")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read_dir(t.lib.join(".wp-uploads"))
+            .unwrap()
+            .count(),
+        0,
+        "the bytes were moved, not copied"
+    );
+    assert_eq!(
+        t.get(&format!("/v1/uploads/{id}")).await.status,
+        404,
+        "the session is gone"
+    );
+
+    // The same bytes again: the server answers with the file at once.
+    let r = t
+        .json(
+            "POST",
+            "/v1/uploads",
+            json!({"parent": fid, "name": "again.raw", "size": bytes.len(), "sha256": hex::encode(Sha256::digest(&bytes))}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["entry"]["id"], e["id"]);
+
+    // Other bytes under a taken name: the next free one.
+    let other = noise(chunk / 2, 9);
+    let r = t
+        .json(
+            "POST",
+            "/v1/uploads",
+            json!({"parent": fid, "name": "big.raw", "size": other.len()}),
+        )
+        .await;
+    let id2 = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        t.chunk(&id2, &other, 0, other.len(), None).await.status,
+        200
+    );
+    let r = t
+        .json("POST", &format!("/v1/uploads/{id2}/complete"), json!({}))
+        .await;
+    assert_eq!(r.status, 201);
+    assert_eq!(r.json()["name"], "big-1.raw");
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/big.raw")).unwrap(),
+        bytes,
+        "never overwritten"
+    );
+}
+
+#[tokio::test]
+async fn upload_sessions_belong_to_their_key_and_expire() {
+    let t = setup().await;
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap();
+    let bytes = noise(1000, 5);
+    let open = |name: &str| json!({"parent": fid, "name": name, "size": bytes.len()});
+
+    // A read-only key opens none.
+    let (_, viewer) = Keys::create(&t.app.db, "viewer", Scope::Read, None, None).unwrap();
+    let as_viewer = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {viewer}"))
+            .header(header::CONTENT_TYPE, "application/json")
+    };
+    let r = t
+        .send(
+            as_viewer("POST", "/v1/uploads")
+                .body(Body::from(open("x.bin").to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 403);
+
+    // Someone else's session is not found.
+    let r = t.json("POST", "/v1/uploads", open("x.bin")).await;
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let r = t
+        .send(
+            as_viewer("GET", &format!("/v1/uploads/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 404);
+
+    // A whole-file digest that does not match: nothing stored, the session gone.
+    assert_eq!(t.chunk(&id, &bytes, 0, bytes.len(), None).await.status, 200);
+    let r = t
+        .send(
+            t.req("POST", &format!("/v1/uploads/{id}/complete"))
+                .header("content-digest", sha_header(b"something else"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.json()["code"], "digest-mismatch");
+    assert!(!t.lib.join("2026/x.bin").exists());
+    assert_eq!(t.get(&format!("/v1/uploads/{id}")).await.status, 404);
+
+    // Abandoned.
+    let r = t.json("POST", "/v1/uploads", open("y.bin")).await;
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let r = t
+        .send(
+            t.req("DELETE", &format!("/v1/uploads/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 204);
+    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
+
+    // Expired: unknown to the API, and swept with its bytes.
+    let r = t.json("POST", "/v1/uploads", open("z.bin")).await;
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    t.app
+        .db
+        .write(|tx| {
+            tx.execute("UPDATE uploads SET expires = 0 WHERE id = ?", [&id])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(t.get(&format!("/v1/uploads/{id}")).await.status, 404);
+    assert_eq!(wirephoto::uploads::purge(&t.app).unwrap(), 1);
+    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
+    // The staging folder is never indexed.
+    rescan(&t).await;
+    assert!(row_at(&t, ".wp-uploads").is_none());
+}

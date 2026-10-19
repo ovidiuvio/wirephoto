@@ -1077,6 +1077,11 @@ pub async fn upkeep(app: Arc<App>) {
                 if let Err(e) = crate::audit::prune(&a, a.config.log.audit_days) {
                     tracing::warn!("pruning the audit trail: {e:#}");
                 }
+                match crate::uploads::purge(&a) {
+                    Ok(n) if n > 0 => tracing::info!(sessions = n, "expired upload sessions removed"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("removing expired uploads: {e:#}"),
+                }
                 let cutoff = crate::util::now_secs() - 30 * 24 * 3600;
                 let _ = a.db.write(|t| {
                     let through: Option<i64> = t.query_row("SELECT MAX(seq) FROM changes WHERE time < ?", [cutoff], |r| r.get(0))?;
