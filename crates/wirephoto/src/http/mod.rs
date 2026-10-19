@@ -35,8 +35,9 @@ async fn server_info(MaybeCaller(key): MaybeCaller) -> Json<ServerInfo> {
             page_size: entries::PAGE_MAX,
             batch: batch::MAX_BATCH as u32,
             previews: bytes::MAX_PREVIEWS as u32,
-            upload_chunk: crate::uploads::CHUNK,
-            upload_parallel: crate::uploads::PARALLEL,
+        },
+        uploads: wirephoto_api::UploadsInfo {
+            tus: "/v1/tus".into(),
         },
         key: key.map(|k| KeyInfo {
             name: k.name,
@@ -123,6 +124,7 @@ fn cors(app: Arc<App>) -> CorsLayer {
             Method::PUT,
             Method::PATCH,
             Method::DELETE,
+            Method::OPTIONS,
         ])
         .allow_headers([
             header::AUTHORIZATION,
@@ -135,6 +137,16 @@ fn cors(app: Arc<App>) -> CorsLayer {
             header::ACCEPT,
             h("content-digest"),
             h("last-event-id"),
+            // tus (/v1/tus)
+            h("tus-resumable"),
+            h("upload-length"),
+            h("upload-offset"),
+            h("upload-metadata"),
+            h("upload-checksum"),
+            h("upload-concat"),
+            h("upload-defer-length"),
+            h("x-http-method-override"),
+            h("x-requested-with"),
         ])
         .expose_headers([
             header::ETAG,
@@ -143,6 +155,18 @@ fn cors(app: Arc<App>) -> CorsLayer {
             header::CONTENT_LENGTH,
             h("server-timing"),
             h("repr-digest"),
+            // tus (/v1/tus)
+            h("upload-offset"),
+            h("upload-length"),
+            h("upload-expires"),
+            h("tus-resumable"),
+            h("tus-version"),
+            h("tus-extension"),
+            h("tus-max-size"),
+            h("tus-checksum-algorithm"),
+            h("wirephoto-entry"),
+            h("wirephoto-entry-name"),
+            h("wirephoto-stored"),
         ])
         .max_age(Duration::from_secs(7200))
         .allow_private_network(true)
@@ -292,14 +316,22 @@ pub fn router(app: Arc<App>) -> Router {
             put(crate::write::put_child),
         )
         .route("/v1/previews", post(bytes::post_previews))
-        .route("/v1/uploads", post(crate::uploads::create))
-        .route(
-            "/v1/uploads/{id}",
-            get(crate::uploads::status)
-                .put(crate::uploads::put_chunk)
-                .delete(crate::uploads::abandon),
+        .merge(
+            Router::new()
+                .route(
+                    "/v1/tus",
+                    post(crate::tus::create).options(crate::tus::options),
+                )
+                .route(
+                    "/v1/tus/{id}",
+                    axum::routing::head(crate::tus::head)
+                        .patch(crate::tus::patch)
+                        .post(crate::tus::patch_override)
+                        .get(crate::tus::outcome)
+                        .delete(crate::tus::terminate),
+                )
+                .route_layer(middleware::from_fn(crate::tus::resumable)),
         )
-        .route("/v1/uploads/{id}/complete", post(crate::uploads::complete))
         .route("/v1/batch", post(batch::post_batch))
         .route("/v1/changes", get(changes::get_changes))
         .fallback(|| async { error::ApiError::not_found() })
@@ -308,5 +340,6 @@ pub fn router(app: Arc<App>) -> Router {
     api.layer(middleware::from_fn(cross_origin_headers))
         .layer(middleware::from_fn_with_state(app.clone(), access_log))
         .layer(cors(app))
+        .layer(middleware::from_fn(crate::tus::discovery))
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }

@@ -85,13 +85,38 @@ impl ApiError {
         )
         .detail(d)
     }
-    pub fn incomplete(d: impl Into<String>) -> ApiError {
+    /// tus: the bytes do not match `Upload-Checksum`, or the whole file its `sha256` (status 460, tus's).
+    pub fn checksum_mismatch() -> ApiError {
+        Self::new(
+            StatusCode::from_u16(460).unwrap(),
+            "checksum-mismatch",
+            "The bytes received do not match their checksum",
+        )
+    }
+    /// tus: another request is writing to this upload.
+    pub fn locked() -> ApiError {
+        Self::new(
+            StatusCode::LOCKED,
+            "locked",
+            "Another request is writing to this upload",
+        )
+    }
+    /// tus: `Upload-Offset` is not where the upload is.
+    pub fn offset_mismatch(d: impl Into<String>) -> ApiError {
         Self::new(
             StatusCode::CONFLICT,
-            "incomplete",
-            "Not every byte of the upload has arrived",
+            "offset-mismatch",
+            "Upload-Offset is not the upload's offset",
         )
         .detail(d)
+    }
+    /// tus: a protocol version the server does not speak.
+    pub fn tus_version() -> ApiError {
+        Self::new(
+            StatusCode::PRECONDITION_FAILED,
+            "tus-version",
+            "Tus-Resumable: 1.0.0 is needed",
+        )
     }
     pub fn too_large(d: impl Into<String>) -> ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "too-large", "Over a limit").detail(d)

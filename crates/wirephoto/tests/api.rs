@@ -247,21 +247,27 @@ async fn cors_allows_key_origins_only() {
     assert_eq!(r.header("access-control-max-age").as_deref(), Some("7200"));
     let r = t.send(pre("https://evil.example")).await;
     assert!(r.header("access-control-allow-origin").is_none());
-    // Every request of an upload session passes a browser's preflight.
+    // Every upload request passes a browser's preflight: tus, as tus-js-client sends it, and a plain PUT.
     for (method, uri, headers) in [
-        ("POST", "/v1/uploads", "authorization,content-type"),
-        (
-            "PUT",
-            "/v1/uploads/upl_x",
-            "authorization,content-range,content-digest",
-        ),
-        ("GET", "/v1/uploads/upl_x", "authorization"),
         (
             "POST",
-            "/v1/uploads/upl_x/complete",
-            "authorization,content-digest",
+            "/v1/tus",
+            "authorization,tus-resumable,upload-length,upload-metadata,content-type,upload-checksum,x-requested-with",
         ),
-        ("DELETE", "/v1/uploads/upl_x", "authorization"),
+        ("HEAD", "/v1/tus/tus_x", "authorization,tus-resumable"),
+        (
+            "PATCH",
+            "/v1/tus/tus_x",
+            "authorization,tus-resumable,upload-offset,content-type,upload-checksum",
+        ),
+        (
+            "POST",
+            "/v1/tus/tus_x",
+            "authorization,tus-resumable,upload-offset,content-type,x-http-method-override",
+        ),
+        ("DELETE", "/v1/tus/tus_x", "authorization,tus-resumable"),
+        ("GET", "/v1/tus/tus_x", "authorization"),
+        ("OPTIONS", "/v1/tus", "tus-resumable"),
         (
             "PUT",
             "/v1/entries/ent_x/children/a.jpg",
@@ -289,6 +295,37 @@ async fn cors_allows_key_origins_only() {
         }
         let methods = r.header("access-control-allow-methods").unwrap_or_default();
         assert!(methods.contains(method), "{method} {uri}: {methods}");
+    }
+    // What tus clients read from the answers is exposed to scripts (on real answers; preflights do not say).
+    let r = t
+        .send(
+            t.req("GET", "/v1")
+                .header(header::ORIGIN, "https://lith.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let exposed = r
+        .header("access-control-expose-headers")
+        .unwrap_or_default();
+    for h in [
+        "location",
+        "upload-offset",
+        "upload-length",
+        "upload-expires",
+        "tus-resumable",
+        "tus-version",
+        "tus-extension",
+        "tus-max-size",
+        "tus-checksum-algorithm",
+        "wirephoto-entry",
+        "wirephoto-entry-name",
+        "wirephoto-stored",
+    ] {
+        assert!(
+            exposed.split(',').any(|e| e.trim() == h),
+            "{h} not exposed: {exposed}"
+        );
     }
     // A cross-origin isolated page (COEP require-corp) may embed previews by their signed URLs.
     let r = t.get("/healthz").await;
@@ -1805,252 +1842,6 @@ fn noise(n: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-impl T {
-    async fn chunk(
-        &self,
-        id: &str,
-        bytes: &[u8],
-        start: usize,
-        end: usize,
-        digest: Option<String>,
-    ) -> Res {
-        let mut req = self.req("PUT", &format!("/v1/uploads/{id}")).header(
-            header::CONTENT_RANGE,
-            format!("bytes {start}-{}/{}", end - 1, bytes.len()),
-        );
-        if let Some(d) = digest {
-            req = req.header("content-digest", d);
-        }
-        self.send(req.body(Body::from(bytes[start..end].to_vec())).unwrap())
-            .await
-    }
-}
-
-fn sha_header(b: &[u8]) -> String {
-    format!("sha-256=:{}:", wirephoto::util::b64(&Sha256::digest(b)))
-}
-
-#[tokio::test]
-async fn upload_sessions_in_chunks_any_order() {
-    let t = setup().await;
-    let r = t.get("/v1").await;
-    assert_eq!(r.json()["limits"]["uploadChunk"], 8 << 20);
-    assert_eq!(r.json()["limits"]["uploadParallel"], 4);
-    let folder = t.entry_at("/2026").await;
-    let fid = folder["id"].as_str().unwrap();
-    let chunk = 8 << 20;
-    let bytes = noise(2 * chunk + 12345, 3);
-
-    let r = t
-        .json(
-            "POST",
-            "/v1/uploads",
-            json!({"parent": fid, "name": "big.raw", "size": bytes.len()}),
-        )
-        .await;
-    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
-    let id = r.json()["id"].as_str().unwrap().to_string();
-    assert!(id.starts_with("upl_"));
-    assert_eq!(r.json()["received"], json!([]));
-    assert_eq!(r.header("location").unwrap(), format!("/v1/uploads/{id}"));
-
-    // Completing early: not everything is there.
-    let r = t
-        .json("POST", &format!("/v1/uploads/{id}/complete"), json!({}))
-        .await;
-    assert_eq!(
-        (r.status, r.json()["code"].clone()),
-        (StatusCode::CONFLICT, json!("incomplete"))
-    );
-
-    // The last chunk first, then the other two at once.
-    let r = t
-        .chunk(
-            &id,
-            &bytes,
-            2 * chunk,
-            bytes.len(),
-            Some(sha_header(&bytes[2 * chunk..])),
-        )
-        .await;
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["received"], json!([[2 * chunk, bytes.len()]]));
-    // A chunk whose digest does not match is not kept.
-    let r = t
-        .chunk(&id, &bytes, 0, chunk, Some(sha_header(b"other")))
-        .await;
-    assert_eq!(r.json()["code"], "digest-mismatch");
-    let (a, b) = tokio::join!(
-        t.chunk(&id, &bytes, 0, chunk, None),
-        t.chunk(&id, &bytes, chunk, 2 * chunk, None)
-    );
-    assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
-    // Resuming: what is there.
-    let r = t.get(&format!("/v1/uploads/{id}")).await;
-    assert_eq!(r.json()["received"], json!([[0, bytes.len()]]));
-    // Over the chunk size, or a wrong total: refused.
-    let r = t
-        .send(
-            t.req("PUT", &format!("/v1/uploads/{id}"))
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes 0-0/{}", bytes.len() + 1),
-                )
-                .body(Body::from(vec![0u8]))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 400);
-
-    let r = t
-        .send(
-            t.req("POST", &format!("/v1/uploads/{id}/complete"))
-                .header("content-digest", sha_header(&bytes))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
-    let e = r.json();
-    assert_eq!(e["name"], "big.raw");
-    assert_eq!(
-        e["sha256"].as_str().unwrap(),
-        hex::encode(Sha256::digest(&bytes))
-    );
-    assert_eq!(std::fs::read(t.lib.join("2026/big.raw")).unwrap(), bytes);
-    assert_eq!(
-        std::fs::read_dir(t.lib.join(".wp-uploads"))
-            .unwrap()
-            .count(),
-        0,
-        "the bytes were moved, not copied"
-    );
-    assert_eq!(
-        t.get(&format!("/v1/uploads/{id}")).await.status,
-        404,
-        "the session is gone"
-    );
-
-    // The same bytes again: the server answers with the file at once.
-    let r = t
-        .json(
-            "POST",
-            "/v1/uploads",
-            json!({"parent": fid, "name": "again.raw", "size": bytes.len(), "sha256": hex::encode(Sha256::digest(&bytes))}),
-        )
-        .await;
-    assert_eq!(r.status, 200);
-    assert_eq!(r.json()["entry"]["id"], e["id"]);
-
-    // Other bytes under a taken name: the next free one.
-    let other = noise(chunk / 2, 9);
-    let r = t
-        .json(
-            "POST",
-            "/v1/uploads",
-            json!({"parent": fid, "name": "big.raw", "size": other.len()}),
-        )
-        .await;
-    let id2 = r.json()["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        t.chunk(&id2, &other, 0, other.len(), None).await.status,
-        200
-    );
-    let r = t
-        .json("POST", &format!("/v1/uploads/{id2}/complete"), json!({}))
-        .await;
-    assert_eq!(r.status, 201);
-    assert_eq!(r.json()["name"], "big-1.raw");
-    assert_eq!(
-        std::fs::read(t.lib.join("2026/big.raw")).unwrap(),
-        bytes,
-        "never overwritten"
-    );
-}
-
-#[tokio::test]
-async fn upload_sessions_belong_to_their_key_and_expire() {
-    let t = setup().await;
-    let folder = t.entry_at("/2026").await;
-    let fid = folder["id"].as_str().unwrap();
-    let bytes = noise(1000, 5);
-    let open = |name: &str| json!({"parent": fid, "name": name, "size": bytes.len()});
-
-    // A read-only key opens none.
-    let (_, viewer) = Keys::create(&t.app.db, "viewer", Scope::Read, None, None).unwrap();
-    let as_viewer = |method: &str, uri: &str| {
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {viewer}"))
-            .header(header::CONTENT_TYPE, "application/json")
-    };
-    let r = t
-        .send(
-            as_viewer("POST", "/v1/uploads")
-                .body(Body::from(open("x.bin").to_string()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 403);
-
-    // Someone else's session is not found.
-    let r = t.json("POST", "/v1/uploads", open("x.bin")).await;
-    let id = r.json()["id"].as_str().unwrap().to_string();
-    let r = t
-        .send(
-            as_viewer("GET", &format!("/v1/uploads/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 404);
-
-    // A whole-file digest that does not match: nothing stored, the session gone.
-    assert_eq!(t.chunk(&id, &bytes, 0, bytes.len(), None).await.status, 200);
-    let r = t
-        .send(
-            t.req("POST", &format!("/v1/uploads/{id}/complete"))
-                .header("content-digest", sha_header(b"something else"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.json()["code"], "digest-mismatch");
-    assert!(!t.lib.join("2026/x.bin").exists());
-    assert_eq!(t.get(&format!("/v1/uploads/{id}")).await.status, 404);
-
-    // Abandoned.
-    let r = t.json("POST", "/v1/uploads", open("y.bin")).await;
-    let id = r.json()["id"].as_str().unwrap().to_string();
-    let r = t
-        .send(
-            t.req("DELETE", &format!("/v1/uploads/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, 204);
-    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
-
-    // Expired: unknown to the API, and swept with its bytes.
-    let r = t.json("POST", "/v1/uploads", open("z.bin")).await;
-    let id = r.json()["id"].as_str().unwrap().to_string();
-    t.app
-        .db
-        .write(|tx| {
-            tx.execute("UPDATE uploads SET expires = 0 WHERE id = ?", [&id])?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(t.get(&format!("/v1/uploads/{id}")).await.status, 404);
-    assert_eq!(wirephoto::uploads::purge(&t.app).unwrap(), 1);
-    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
-    // The staging folder is never indexed.
-    rescan(&t).await;
-    assert!(row_at(&t, ".wp-uploads").is_none());
-}
-
 /// Files and folders deleted on disk behind the server's back, before it has noticed: never taken for being
 /// there.
 #[tokio::test]
@@ -2086,15 +1877,17 @@ async fn what_is_gone_from_the_disk_is_never_taken_for_there() {
         json!([]),
         "a deleted file is not offered for dedup"
     );
-    // Nor does opening an upload session take it for there.
+    // Nor does a resumable upload take it for there: the bytes are stored.
     let r = t
-        .json(
-            "POST",
-            "/v1/uploads",
-            json!({"parent": fid, "name": "two.jpg", "size": bytes.len(), "sha256": sha}),
+        .send(
+            t.tus_create(&fid, "two.jpg", bytes.len(), Some(&sha))
+                .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                .body(Body::from(bytes.clone()))
+                .unwrap(),
         )
         .await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("wirephoto-stored").as_deref(), Some("created"));
 
     // A folder deleted on disk: writing into it is 404, and the index forgets it.
     let gone = t.entry_at("/2026/Lisbon").await;
@@ -2184,4 +1977,332 @@ async fn watched_deletes_leave_the_index_and_a_folder_made_again_is_watched() {
         indexed("trip/day1/b.jpg", true).await,
         "the folder made again is watched"
     );
+}
+
+impl T {
+    /// `POST /v1/tus` for a file of `len` bytes named `name` in `parent`.
+    fn tus_create(
+        &self,
+        parent: &str,
+        name: &str,
+        len: usize,
+        sha256: Option<&str>,
+    ) -> axum::http::request::Builder {
+        let b = |s: &str| wirephoto::util::b64(s.as_bytes());
+        let mut meta = format!("parent {},filename {}", b(parent), b(name));
+        if let Some(h) = sha256 {
+            meta.push_str(&format!(",sha256 {}", b(h)));
+        }
+        self.req("POST", "/v1/tus")
+            .header("tus-resumable", "1.0.0")
+            .header("upload-length", len.to_string())
+            .header("upload-metadata", meta)
+    }
+
+    fn tus_patch(&self, id: &str, offset: usize) -> axum::http::request::Builder {
+        self.req("PATCH", &format!("/v1/tus/{id}"))
+            .header("tus-resumable", "1.0.0")
+            .header("upload-offset", offset.to_string())
+            .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+    }
+
+    async fn tus_head(&self, id: &str) -> Res {
+        self.send(
+            self.req("HEAD", &format!("/v1/tus/{id}"))
+                .header("tus-resumable", "1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+}
+
+fn tus_id(r: &Res) -> String {
+    r.header("location")
+        .unwrap()
+        .strip_prefix("/v1/tus/")
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn tus_whole_file_resumes_after_a_broken_connection() {
+    let t = setup().await;
+    assert_eq!(t.get("/v1").await.json()["uploads"]["tus"], "/v1/tus");
+    let r = t
+        .send(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/tus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.header("tus-resumable").as_deref(), Some("1.0.0"));
+    assert_eq!(r.header("tus-version").as_deref(), Some("1.0.0"));
+    assert!(
+        r.header("tus-extension")
+            .unwrap()
+            .contains("creation-with-upload")
+    );
+    assert!(r.header("tus-checksum-algorithm").unwrap().contains("sha1"));
+
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap();
+    let bytes = noise(3_000_000, 4);
+    let r = t
+        .send(
+            t.tus_create(fid, "big.raw", bytes.len(), None)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("tus-resumable").as_deref(), Some("1.0.0"));
+    assert!(r.header("upload-expires").unwrap().ends_with("GMT"));
+    let id = tus_id(&r);
+    let r = t.tus_head(&id).await;
+    assert_eq!(
+        (r.status, r.header("upload-offset").as_deref()),
+        (StatusCode::OK, Some("0"))
+    );
+    assert_eq!(r.header("upload-length"), Some(bytes.len().to_string()));
+    assert_eq!(r.header("cache-control").as_deref(), Some("no-store"));
+
+    // The whole file in one PATCH, and the connection breaks after the first million bytes: they are kept.
+    let first = bytes[..1_000_000].to_vec();
+    let stream = futures::stream::iter(vec![
+        Ok::<_, std::io::Error>(bytes::Bytes::from(first)),
+        Err(std::io::Error::other("connection reset")),
+    ]);
+    let r = t
+        .send(t.tus_patch(&id, 0).body(Body::from_stream(stream)).unwrap())
+        .await;
+    assert_ne!(r.status, 204);
+    let r = t.tus_head(&id).await;
+    assert_eq!(r.header("upload-offset").as_deref(), Some("1000000"));
+
+    // The wrong offset, a missing Tus-Resumable, a checksum that does not match: refused, nothing moves.
+    let r = t
+        .send(t.tus_patch(&id, 0).body(Body::from(bytes.clone())).unwrap())
+        .await;
+    assert_eq!(r.status, 409);
+    let r = t
+        .send(
+            t.req("PATCH", &format!("/v1/tus/{id}"))
+                .header("upload-offset", "1000000")
+                .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                .body(Body::from(bytes[1_000_000..].to_vec()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 412);
+    let sha1 = |b: &[u8]| format!("sha1 {}", wirephoto::util::b64(&sha1::Sha1::digest(b)));
+    let r = t
+        .send(
+            t.tus_patch(&id, 1_000_000)
+                .header("upload-checksum", sha1(b"other bytes"))
+                .body(Body::from(bytes[1_000_000..].to_vec()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status.as_u16(), 460);
+    assert_eq!(
+        t.tus_head(&id).await.header("upload-offset").as_deref(),
+        Some("1000000")
+    );
+
+    // The rest, checked: the file is stored, and the answer says where.
+    let r = t
+        .send(
+            t.tus_patch(&id, 1_000_000)
+                .header("upload-checksum", sha1(&bytes[1_000_000..]))
+                .body(Body::from(bytes[1_000_000..].to_vec()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("upload-offset"), Some(bytes.len().to_string()));
+    assert_eq!(r.header("wirephoto-stored").as_deref(), Some("created"));
+    assert_eq!(
+        r.header("wirephoto-entry-name").as_deref(),
+        Some("big%2Eraw")
+    );
+    let entry = r.header("wirephoto-entry").unwrap();
+    assert_eq!(std::fs::read(t.lib.join("2026/big.raw")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read_dir(t.lib.join(".wp-uploads"))
+            .unwrap()
+            .count(),
+        0,
+        "moved, not copied"
+    );
+    // For a client whose answer was lost.
+    let r = t.get(&format!("/v1/tus/{id}")).await;
+    assert_eq!(r.json()["entry"]["id"], entry);
+    assert_eq!(r.json()["created"], true);
+    assert_eq!(
+        r.json()["entry"]["sha256"].as_str().unwrap(),
+        hex::encode(Sha256::digest(&bytes))
+    );
+}
+
+#[tokio::test]
+async fn tus_creation_with_upload_dedup_names_keys_and_expiry() {
+    let t = setup().await;
+    let folder = t.entry_at("/2026").await;
+    let fid = folder["id"].as_str().unwrap().to_string();
+    let octets = |b: axum::http::request::Builder| {
+        b.header(header::CONTENT_TYPE, "application/offset+octet-stream")
+    };
+    let bytes = noise(50_000, 7);
+    let sha = hex::encode(Sha256::digest(&bytes));
+
+    // A small file in one request.
+    let r = t
+        .send(
+            octets(t.tus_create(&fid, "x.bin", bytes.len(), Some(&sha)))
+                .body(Body::from(bytes.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("upload-offset"), Some(bytes.len().to_string()));
+    assert_eq!(r.header("wirephoto-stored").as_deref(), Some("created"));
+    let first = r.header("wirephoto-entry").unwrap();
+    // The same bytes again: the file the folder has.
+    let r = t
+        .send(
+            octets(t.tus_create(&fid, "copy.bin", bytes.len(), None))
+                .body(Body::from(bytes.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.header("wirephoto-stored").as_deref(), Some("existed"));
+    assert_eq!(r.header("wirephoto-entry"), Some(first.clone()));
+    // Other bytes under a taken name: the next free one, through a proxy that refuses PATCH.
+    let other = noise(70_000, 8);
+    let r = t
+        .send(
+            t.tus_create(&fid, "x.bin", other.len(), None)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let id = tus_id(&r);
+    let r = t
+        .send(
+            t.req("POST", &format!("/v1/tus/{id}"))
+                .header("x-http-method-override", "PATCH")
+                .header("tus-resumable", "1.0.0")
+                .header("upload-offset", "0")
+                .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                .body(Body::from(other.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.header("wirephoto-entry-name").as_deref(),
+        Some("x%2D1%2Ebin")
+    );
+    assert_eq!(
+        std::fs::read(t.lib.join("2026/x.bin")).unwrap(),
+        bytes,
+        "never overwritten"
+    );
+
+    // Bytes that do not match the sha256 they were announced with: nothing stored.
+    let r = t
+        .send(
+            octets(t.tus_create(&fid, "bad.bin", other.len(), Some(&sha)))
+                .body(Body::from(other.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status.as_u16(), 460);
+    assert!(!t.lib.join("2026/bad.bin").exists());
+
+    // Someone else's upload is not found; a read-only key creates none.
+    let r = t
+        .send(
+            t.tus_create(&fid, "y.bin", 10, None)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let id = tus_id(&r);
+    let (_, viewer) = Keys::create(&t.app.db, "viewer", Scope::Read, None, None).unwrap();
+    let as_viewer = |b: axum::http::request::Builder| {
+        let mut b = b;
+        b.headers_mut().unwrap().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {viewer}").parse().unwrap(),
+        );
+        b
+    };
+    let r = t
+        .send(
+            as_viewer(
+                t.req("HEAD", &format!("/v1/tus/{id}"))
+                    .header("tus-resumable", "1.0.0"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 404);
+    let r = t
+        .send(
+            as_viewer(t.tus_create(&fid, "z.bin", 10, None))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 403);
+
+    // Terminated.
+    let r = t
+        .send(
+            t.req("DELETE", &format!("/v1/tus/{id}"))
+                .header("tus-resumable", "1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 204);
+    assert_eq!(t.tus_head(&id).await.status, 404);
+    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
+
+    // Expired: unknown, and swept with its bytes.
+    let r = t
+        .send(
+            t.tus_create(&fid, "w.bin", 10, None)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let id = tus_id(&r);
+    t.app
+        .db
+        .write(|tx| {
+            tx.execute("UPDATE tus SET expires = 0 WHERE id = ?", [&id])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(t.tus_head(&id).await.status, 404);
+    assert_eq!(wirephoto::tus::purge(&t.app).unwrap(), 1);
+    assert!(!t.lib.join(format!(".wp-uploads/{id}")).exists());
+
+    // A folder gone from the disk: 404.
+    let gone = t.entry_at("/2026/Lisbon").await;
+    std::fs::remove_dir_all(t.lib.join("2026/Lisbon")).unwrap();
+    let r = t
+        .send(
+            t.tus_create(gone["id"].as_str().unwrap(), "v.bin", 10, None)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 404);
 }

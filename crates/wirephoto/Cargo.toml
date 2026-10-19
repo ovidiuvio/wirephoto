@@ -37,6 +37,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.5", features = ["fs", "net", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha1 = "0.11"
 sha2 = "0.11.1"
 subtle = "2.6.1"
 tempfile = "3.27.0"
@@ -62,3 +63,7 @@ heic = ["dep:libheif-rs"]
 # jpegli for the cached 640 px previews (built from crates/jpegli-sys/vendor with cmake); without it,
 # libjpeg-turbo with Huffman optimisation encodes them.
 jpegli = ["dep:jpegli-sys"]
+
+[dev-dependencies]
+bytes = "1.12.1"
+sha1 = "0.11"

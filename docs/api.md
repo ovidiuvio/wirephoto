@@ -23,7 +23,7 @@ are in [design.md](design.md).
    fields, `DELETE` deletes. Paths are nouns.
 2. **JSON** for everything except file bytes and previews. Fields are `camelCase`, timestamps RFC 3339, sizes in
    bytes, durations in seconds. A field that does not apply is omitted.
-3. **IDs** are opaque strings: `lib_…` for libraries, `ent_…` for entries, `upl_…` for upload sessions. An entry keeps its ID when it is
+3. **IDs** are opaque strings: `lib_…` for libraries, `ent_…` for entries, `tus_…` for resumable uploads. An entry keeps its ID when it is
    renamed, moved or trashed. Clients never build IDs from paths.
 4. **URLs are given, not built.** Entries carry the URLs of their bytes and previews; clients use them as they
    are.
@@ -78,12 +78,14 @@ wirephoto keys revoke laptop-browser
   "name": "wirephoto",
   "version": "1.0.0",
   "previews": {"sizes": [160, 320, 480, 640, 1280, 2560]},
-  "limits": {"pageSize": 1000, "batch": 100, "previews": 500, "uploadChunk": 8388608, "uploadParallel": 4},
+  "limits": {"pageSize": 1000, "batch": 100, "previews": 500},
+  "uploads": {"tus": "/v1/tus"},
   "key": {"name": "laptop-browser", "scope": "write", "libraries": ["lib_nas"]}
 }
 ```
 
 No key required. `key` describes the key sent with the request, and is omitted when there is none.
+`uploads.tus` is where resumable uploads go (section 6); a server without it takes uploads by `PUT` only.
 
 ### Libraries
 
@@ -261,51 +263,47 @@ The request body is the file. Never refused for its name, and never overwrites a
 
 The file appears whole or not at all. `If-None-Match: *` is accepted and changes nothing.
 
-### Upload sessions — large files in chunks
+### Resumable uploads — tus
 
-For a file larger than `limits.uploadChunk` (`GET /v1`): sent in chunks, several at once
-(`limits.uploadParallel`) and in any order, and resumable after a dropped connection or a reload. Once
-complete it is stored exactly like a `PUT` into the folder. A session belongs to the key that opened it (anyone
-else gets `404`), needs a `write` key and a library that is not read-only (`403`), and expires 48 hours after it
-was opened, with whatever it received.
+Large files, and any upload that must survive a dropped connection or a reload, go through
+[tus 1.0.0](https://tus.io/protocols/resumable-upload) at `/v1/tus` (`GET /v1` `uploads.tus`), with the
+**creation**, **creation-with-upload**, **checksum**, **termination** and **expiration** extensions: the whole file
+in one request when nothing breaks, and after a break the client asks how far it got and sends the rest. Any tus
+client works (tus-js-client with its defaults). Once all its bytes are there the file is stored exactly like a
+`PUT` into its folder. Uploads need a `write` key and a library that is not read-only (`403`), belong to the key
+that created them (anyone else gets `404`), and expire 48 hours after creation (`Upload-Expires`). Every request
+carries `Tus-Resumable: 1.0.0` (else `412`), and so does every answer.
 
-**`POST /v1/uploads`** opens one:
+**`OPTIONS /v1/tus`** says what the server speaks: `Tus-Version: 1.0.0`, `Tus-Extension`, and
+`Tus-Checksum-Algorithm: sha1,sha256`. There is no size limit beyond the disk.
 
-```json
-{"parent": "ent_7c2e", "name": "DSC01234.ARW", "size": 61234567, "sha256": "9f86d0…"}
-```
+**`POST /v1/tus`** creates an upload. `Upload-Length` is the file's size; `Upload-Metadata` (tus's
+`key base64value,…`) has `parent` (the folder's entry ID), `filename`, and optionally `sha256` (the whole file's
+hash, lowercase hex: checked at the end). `201` with `Location: /v1/tus/{id}` and `Upload-Expires`. With a body
+(`Content-Type: application/offset+octet-stream`, creation-with-upload) the bytes are stored at once and the
+answer has `Upload-Offset`; a small file is one request. A folder gone from the disk is `404`.
 
-`sha256` (lowercase hex) is optional. When it is given and the folder already holds those bytes, nothing needs
-uploading: `200 {"entry": …}` with that file. Otherwise `201`, `Location: /v1/uploads/{id}`, and the session:
+**`HEAD /v1/tus/{id}`**: `Upload-Offset` (how much has arrived), `Upload-Length`, `Upload-Expires`,
+`Cache-Control: no-store`. To resume, `PATCH` from that offset.
 
-```json
-{"id": "upl_Qm3x", "size": 61234567, "chunk": 8388608, "received": [], "expires": "2026-10-21T14:02:11Z"}
-```
+**`PATCH /v1/tus/{id}`** (or `POST` with `X-HTTP-Method-Override: PATCH`) with `Upload-Offset` (the current
+offset, else `409 offset-mismatch`) and `Content-Type: application/offset+octet-stream`: the bytes from there, up
+to the rest of the file in one request. Bytes that arrived before a connection broke count. An optional
+`Upload-Checksum: sha1|sha256 <base64>` covers the request's bytes: on a mismatch they are discarded, the offset
+stays, and the answer is `460 checksum-mismatch`. A second request writing to the same upload meanwhile is
+`423 locked` (clients retry). `204` with the new `Upload-Offset`.
 
-`received` lists the byte ranges stored so far as `[start, end)` pairs, merged and in order.
+**When the last byte arrives** (in a `PATCH`, or in the creating `POST`) the file is checked against the creation
+`sha256`, when given (a mismatch stores nothing, ends the upload and is `460`), then stored as by `PUT`: kept as
+the file the folder already has with these bytes, or under `filename` or the next free name. That answer says
+where, in headers: `Wirephoto-Entry` (the entry ID), `Wirephoto-Entry-Name` (its name, percent-encoded) and
+`Wirephoto-Stored: created` or `existed`. A client whose last answer was lost reads the same from
+**`GET /v1/tus/{id}`**, for an hour: `200 {"entry": …, "created": true}` (`404` until the upload is finished).
 
-**`PUT /v1/uploads/{id}`** stores one chunk. The body is the bytes;
-`Content-Range: bytes <first>-<last>/<size>` says where they go (`<size>` is the file's). Every chunk is at most
-`chunk` bytes; chunks may arrive in any order, at once, or again (a retry). An optional `Content-Digest` checks
-the chunk: a mismatch is `400 digest-mismatch` and the chunk is not counted. A chunk counts once it is on disk.
-`200`:
+**`DELETE /v1/tus/{id}`** (termination) abandons the upload and its bytes: `204`.
 
-```json
-{"received": [[0, 16777216], [58720256, 61234567]]}
-```
-
-**`GET /v1/uploads/{id}`** answers the session as above: to resume, send what `received` does not cover.
-
-**`POST /v1/uploads/{id}/complete`** stores the file once every byte has arrived (otherwise `409 incomplete`),
-checked against the `Content-Digest` header (whole file) or else the `sha256` given when opening; on a
-mismatch nothing is stored, the session is gone, and the answer is `400 digest-mismatch`. Then, as with `PUT`:
-`200` with the existing entry if the folder already holds these bytes, else `201` with the new entry under
-`name` or the next free name. The file appears whole or not at all; the session is gone after either.
-
-**`DELETE /v1/uploads/{id}`** abandons the session and its bytes: `204`.
-
-The server keeps the bytes in the library's own `.wp-uploads` folder (never listed), so completing moves them
-into place without copying.
+The server keeps the bytes in the library's own `.wp-uploads` folder (never listed), so storing moves them into
+place without copying.
 
 ### `PUT /v1/entries/{id}/content` — new contents for a file
 
@@ -371,8 +369,8 @@ and in the background for files already in the library.
 - **To find duplicates** already in a library: `GET /v1/entries?library={id}&duplicates=true`.
 
 Only files on disk count. A file or folder deleted (or changed) on disk behind the server's back is never
-taken for being there, even before the server has noticed: lookups by hash leave it out, a `PUT` or upload
-session stores the bytes instead of answering with it, a copy of it or a write into such a folder is `404`, and
+taken for being there, even before the server has noticed: lookups by hash leave it out, a `PUT` or tus upload
+stores the bytes instead of answering with it, a copy of it or a write into such a folder is `404`, and
 the server lists the folder again at once so the index forgets it.
 
 The server never merges or removes duplicates itself.
@@ -461,11 +459,14 @@ Apps act on `code`; `title` and `detail` are for people.
 | `unauthenticated` | 401 | Missing, unknown or revoked key; bad `sig` |
 | `forbidden` | 403 | Read-only key or library; key used from another origin |
 | `not-found` | 404 | No such entry or library |
-| `conflict` | 409 | Move across libraries; deleting what is in the trash; a folder into itself; an upload being completed |
-| `incomplete` | 409 | Completing an upload before every byte has arrived |
+| `conflict` | 409 | Move across libraries; deleting what is in the trash; a folder into itself |
+| `offset-mismatch` | 409 | tus: `Upload-Offset` is not where the upload is |
+| `tus-version` | 412 | tus: no `Tus-Resumable: 1.0.0` |
+| `locked` | 423 | tus: another request is writing to the upload |
+| `checksum-mismatch` | 460 | tus: the bytes do not match `Upload-Checksum`, or the file its `sha256` |
 | `history-expired` | 410 | `since` is older than the kept history |
 | `version-mismatch` | 412 | `If-Match` failed (`PATCH`, `DELETE`) |
-| `too-large` | 413 | Over a limit (batch, previews, an upload chunk) |
+| `too-large` | 413 | Over a limit (batch, previews) |
 | `unsupported-media` | 415 | Cannot preview this file |
 | `not-cached` | 504 | `only-if-cached` and the preview is not made yet |
 | `preview-failed` | 503 | The preview could not be made this time (a decoder crashed, the file could not be opened); try again |
@@ -485,9 +486,9 @@ Apps act on `code`; `title` and `detail` are for people.
 | GET, PUT | `/v1/entries/{id}/content` | Read, replace bytes |
 | GET | `/v1/entries/{id}/preview/{size}.jpg` | One preview |
 | PUT | `/v1/entries/{folder}/children/{name}` | New file |
-| POST | `/v1/uploads` | Open an upload session (large files in chunks) |
-| GET, PUT, DELETE | `/v1/uploads/{id}` | Session state, one chunk, abandon |
-| POST | `/v1/uploads/{id}/complete` | Store the uploaded file |
+| OPTIONS, POST | `/v1/tus` | tus: what it speaks; create an upload (with its first bytes) |
+| HEAD, PATCH, DELETE | `/v1/tus/{id}` | tus: offset, more bytes, abandon |
+| GET | `/v1/tus/{id}` | Where a finished upload went |
 | POST | `/v1/previews` | Many previews, streamed |
 | POST | `/v1/batch` | Many requests in one |
 | GET | `/v1/changes` | Changes since, or live |

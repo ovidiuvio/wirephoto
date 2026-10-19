@@ -61,7 +61,7 @@ pub fn kind_of(method: &str, path: &str) -> &'static str {
         ("GET", ["v1", "entries", _, "preview", _]) => "previews",
         ("POST", ["v1", "previews"]) => "batch previews",
         ("GET" | "HEAD", ["v1", "entries", _, "content"]) => "originals",
-        ("PUT", ["v1", "entries", ..]) | (_, ["v1", "uploads", ..]) => "uploads",
+        ("PUT", ["v1", "entries", ..]) | (_, ["v1", "tus", ..]) => "uploads",
         (_, ["v1", "entries", ..]) => "changes made",
         (_, ["v1", "batch"]) => "batch",
         (_, ["v1", "changes"]) => "change feed",
@@ -145,7 +145,7 @@ mod tests {
             kind_of("PUT", "/v1/entries/ent_1/children/a.jpg"),
             "uploads"
         );
-        assert_eq!(kind_of("PUT", "/v1/uploads/upl_1"), "uploads");
+        assert_eq!(kind_of("PATCH", "/v1/tus/tus_1"), "uploads");
         assert_eq!(kind_of("PATCH", "/v1/entries/ent_1"), "changes made");
         assert_eq!(kind_of("GET", "/v1/changes"), "change feed");
         let m = Metrics::default();

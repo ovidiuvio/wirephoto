@@ -342,6 +342,34 @@ pub(crate) async fn store_new(
     kept: Option<Vec<u8>>,
     started: std::time::Instant,
 ) -> ApiResult<Response> {
+    let (entry, created) =
+        store(app, key, info, parent, name, lib, tmp, sha, kept, started).await?;
+    if !created {
+        return Ok(entry_response(entry));
+    }
+    let location = format!("/v1/entries/{}", entry.id);
+    let mut r = entry_response(entry);
+    *r.status_mut() = StatusCode::CREATED;
+    r.headers_mut()
+        .insert(header::LOCATION, location.parse().unwrap());
+    Ok(r)
+}
+
+/// [`store_new`] without the response: the entry, and whether it was stored (`false`: the folder already had
+/// these bytes). Starts its cached preview and records it in the audit trail.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store(
+    app: Arc<App>,
+    key: crate::auth::KeyRow,
+    info: Option<crate::audit::RequestInfo>,
+    parent: EntryRow,
+    name: String,
+    lib: Arc<Library>,
+    tmp: String,
+    sha: [u8; 32],
+    kept: Option<Vec<u8>>,
+    started: std::time::Instant,
+) -> ApiResult<(wirephoto_api::Entry, bool)> {
     let asked = name.clone();
     let a = app.clone();
     let lib2 = lib.clone();
@@ -433,7 +461,7 @@ pub(crate) async fn store_new(
         });
     }
     if !created {
-        return Ok(entry_response(entry));
+        return Ok((entry, false));
     }
     // Bytes in memory reach a decoder through a pipe, which ffmpeg cannot seek: videos are read from the file.
     let src = match kept {
@@ -444,12 +472,7 @@ pub(crate) async fn store_new(
         ),
     };
     pregenerate(&app, id, src);
-    let location = format!("/v1/entries/{}", entry.id);
-    let mut r = entry_response(entry);
-    *r.status_mut() = StatusCode::CREATED;
-    r.headers_mut()
-        .insert(header::LOCATION, location.parse().unwrap());
-    Ok(r)
+    Ok((entry, true))
 }
 
 /// `POST /v1/entries`: a folder or a copy.

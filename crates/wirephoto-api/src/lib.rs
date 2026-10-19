@@ -13,6 +13,7 @@ pub struct ServerInfo {
     pub version: String,
     pub previews: PreviewInfo,
     pub limits: Limits,
+    pub uploads: UploadsInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<KeyInfo>,
 }
@@ -29,10 +30,14 @@ pub struct Limits {
     pub page_size: u32,
     pub batch: u32,
     pub previews: u32,
-    /// Bytes per chunk of an upload session (`PUT /v1/uploads/{id}`), the last one may be shorter.
-    pub upload_chunk: u64,
-    /// Chunks worth sending at once.
-    pub upload_parallel: u32,
+}
+
+/// Where files go up besides `PUT /v1/entries/{folder}/children/{name}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadsInfo {
+    /// The tus creation URL (resumable uploads, api.md section 6).
+    pub tus: String,
 }
 
 /// The key a request was made with.
@@ -167,38 +172,6 @@ pub struct Page<T> {
     pub items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-}
-
-/// `POST /v1/uploads`: a file to upload in chunks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateUpload {
-    /// The folder it goes into.
-    pub parent: String,
-    pub name: String,
-    pub size: u64,
-    /// Lowercase hex, when known: lets the server answer at once when the folder already holds these bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-}
-
-/// An upload session (`POST /v1/uploads`, `GET /v1/uploads/{id}`). `received` lists the byte ranges stored so
-/// far, `[start, end)`, merged and in order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Upload {
-    pub id: String,
-    pub size: u64,
-    pub chunk: u64,
-    pub received: Vec<[u64; 2]>,
-    pub expires: String,
-}
-
-/// `PUT /v1/uploads/{id}`: what is stored after the chunk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Received {
-    pub received: Vec<[u64; 2]>,
 }
 
 /// `POST /v1/entries`: a folder (`kind: "folder"`) or a copy (`copyOf`).

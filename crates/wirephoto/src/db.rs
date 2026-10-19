@@ -89,20 +89,22 @@ CREATE TABLE IF NOT EXISTS keys (
     last_used  INTEGER
 );
 
--- Upload sessions (POST /v1/uploads): the bytes in the library's .wp-uploads/<id>, the ranges received as JSON
-CREATE TABLE IF NOT EXISTS uploads (
-    id        TEXT PRIMARY KEY,
-    key       TEXT NOT NULL,
-    library   TEXT NOT NULL,
-    parent    TEXT NOT NULL,
-    name      TEXT NOT NULL,
-    size      INTEGER NOT NULL,
-    sha256    BLOB,
-    received  TEXT NOT NULL DEFAULT '[]',
-    -- 0 open, 1 being completed
-    state     INTEGER NOT NULL DEFAULT 0,
-    created   INTEGER NOT NULL,
-    expires   INTEGER NOT NULL
+-- Resumable uploads (tus, /v1/tus): the bytes in the library's .wp-uploads/<id>; once stored, the entry it
+-- became (created_entry 0: the folder had those bytes already), kept until expires.
+DROP TABLE IF EXISTS uploads;
+CREATE TABLE IF NOT EXISTS tus (
+    id            TEXT PRIMARY KEY,
+    key           TEXT NOT NULL,
+    library       TEXT NOT NULL,
+    parent        TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    length        INTEGER NOT NULL,
+    sha256        BLOB,
+    received      INTEGER NOT NULL DEFAULT 0,
+    created       INTEGER NOT NULL,
+    expires       INTEGER NOT NULL,
+    entry         TEXT,
+    created_entry INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS meta (

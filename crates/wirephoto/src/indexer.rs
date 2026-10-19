@@ -1128,8 +1128,8 @@ pub async fn upkeep(app: Arc<App>) {
                 if let Err(e) = crate::audit::prune(&a, a.config.log.audit_days) {
                     tracing::warn!("pruning the audit trail: {e:#}");
                 }
-                match crate::uploads::purge(&a) {
-                    Ok(n) if n > 0 => tracing::info!(sessions = n, "expired upload sessions removed"),
+                match crate::tus::purge(&a) {
+                    Ok(n) if n > 0 => tracing::info!(uploads = n, "expired uploads removed"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!("removing expired uploads: {e:#}"),
                 }
@@ -1639,16 +1639,7 @@ fn status_snapshot(
             use crate::metrics::Metrics;
             let m = &app.metrics;
             UploadCounts {
-                open: app
-                    .db
-                    .read(|c| {
-                        Ok(c.query_row(
-                            "SELECT COUNT(*) FROM uploads WHERE expires > ?",
-                            [crate::util::now_secs()],
-                            |r| r.get::<_, i64>(0),
-                        )?)
-                    })
-                    .unwrap_or(0) as u64,
+                open: crate::tus::open_count(app),
                 opened: Metrics::get(&m.uploads_opened),
                 completed: Metrics::get(&m.uploads_completed),
                 abandoned: Metrics::get(&m.uploads_abandoned),

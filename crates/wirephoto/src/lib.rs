@@ -14,7 +14,7 @@ pub mod media;
 pub mod metrics;
 pub mod preview;
 pub mod resources;
-pub mod uploads;
+pub mod tus;
 pub mod util;
 pub mod write;
 

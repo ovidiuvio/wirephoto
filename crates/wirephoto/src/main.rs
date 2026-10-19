@@ -887,7 +887,7 @@ fn status(config: &Config) -> anyhow::Result<()> {
     }
     let u = &s.uploads;
     println!(
-        "Uploads: {} sessions open; since start {} opened, {} completed, {} abandoned, {} expired; {} received",
+        "Uploads (tus): {} unfinished; since start {} created, {} stored, {} abandoned, {} expired; {} received",
         n(u.open),
         n(u.opened),
         n(u.completed),
