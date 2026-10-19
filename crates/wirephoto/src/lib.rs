@@ -175,18 +175,12 @@ fn gpu_candidate(
     ffmpeg: bool,
 ) -> (Option<(decode::accel::Api, Option<String>)>, String) {
     if cfg.gpu == config::GpuMode::Off {
-        return (None, "off ([decode] gpu = \"off\")".into());
+        return (None, "off (turn it on with [decode] gpu = \"on\")".into());
     }
     if !ffmpeg {
         return (None, "none: no ffmpeg".into());
     }
     if cfg!(target_os = "macos") {
-        if cfg.gpu != config::GpuMode::On {
-            return (
-                None,
-                "not used: VideoToolbox is slower than the CPU path here ([decode] gpu = \"on\" uses it)".into(),
-            );
-        }
         return (
             Some((decode::accel::Api::VideoToolbox, None)),
             String::new(),

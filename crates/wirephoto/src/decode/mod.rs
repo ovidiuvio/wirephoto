@@ -284,7 +284,26 @@ fn decode(
             // (dav1d is fast already), not with transparency (libheif blends it).
             let heic = matches!(src, Source::File(_)) && !is_avif(&bytes) && tools.is_some();
             if let (true, Some(meta)) = (heic, render::heif_meta(&bytes).filter(|m| !m.alpha)) {
+                let mut grid_failed = false;
                 if let Some((g, t)) = gpu.filter(|(g, _)| g.hevc || g.hevc10) {
+                    // A grid (every phone and camera HEIC): all its tiles in one GPU session.
+                    match accel::heic_grid(
+                        t,
+                        Some(g),
+                        &bytes,
+                        size,
+                        meta.icc.clone(),
+                        meta.orientation,
+                    ) {
+                        Ok(Some(d)) => return Ok((d, how::GPU)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            grid_failed = true;
+                            gpu_failed(e);
+                        }
+                    }
+                }
+                if !grid_failed && let Some((g, t)) = gpu.filter(|(g, _)| g.hevc || g.hevc10) {
                     match accel::heic(t, Some(g), &src, size, meta.icc.clone(), meta.orientation) {
                         Ok(Some(d)) => return Ok((d, how::GPU)),
                         Ok(None) => {} // a format this GPU does not decode

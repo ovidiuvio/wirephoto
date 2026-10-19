@@ -66,7 +66,7 @@ pregenerate = true
 
 [decode]
 workers = 4              # previews made at once: the number of CPU cores is a good start
-gpu = "auto"             # use Quick Sync when found working at start (step 6)
+# gpu = "on"             # decode on the NAS's GPU (Intel Quick Sync): off unless set; see step 6
 ```
 
 More than one library: repeat the `[[library]]` block with another `id` and `path` (and another volume line
@@ -153,7 +153,14 @@ Project → wirephoto → Stop, then edit):
 
 Then **Build** (or Start) the project again.
 
-**d. Check that it is in use.** The log at start says
+**d. Turn it on** in `wirephoto.toml` (it is off unless set there), then restart the project:
+
+```toml
+[decode]
+gpu = "on"
+```
+
+**e. Check that it is in use.** The log at start says
 
 ```
 INFO wirephoto: decoding on the GPU: VA-API /dev/dri/renderD128: HEVC, HEVC 10-bit, JPEG
@@ -171,12 +178,17 @@ What the `GPU:` line can say:
 | `none: no /dev/dri/renderD128 (map /dev/dri into the container)` | The `devices:` lines are missing, or DSM has no GPU driver |
 | `not used: ...` | The test pictures did not decode on the GPU; the message says why. Most often the container user is not in the device's group (check `group_add` against `ls -ln /dev/dri`); otherwise compare with step b. Everything runs on the CPU |
 | `turned off after 5 failures in a row` | The GPU worked at start and then kept failing; restart the container to try it again |
-| `off ([decode] gpu = "off")` | Turned off in the config |
+| `off (turn it on with [decode] gpu = "on")` | Off: the default, or `gpu = "off"` |
 
 A note on the sandbox: wirephoto decodes photos in worker processes that may not create or change files. Using
 the GPU needs its device opened read-write, so with a GPU those workers may open existing files read-write
 (still not create, truncate or delete them). Where the kernel has no seccomp filters (DSM's often has not; the
-log says so at start) this filter is not active anyway; `gpu = "off"` keeps the strict sandbox.
+log says so at start) this filter is not active anyway; with the GPU off (the default) the sandbox stays strict.
+
+How it decodes a HEIC on the GPU: a phone or camera HEIC is a grid of small tiles (48 for a 12 MP iPhone photo).
+wirephoto reads the tiles from the file and sends them to the GPU as one stream, so the whole photo is one
+decoding session, and ffmpeg lays the tiles out again. A HEIC the GPU does not take (4:2:2, transparency) is
+decoded on the CPU.
 
 ## 7. Watching for changes (inotify)
 

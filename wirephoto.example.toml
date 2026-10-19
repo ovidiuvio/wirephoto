@@ -31,8 +31,8 @@ pregenerate = true       # make the 640 px preview of every photo ahead of time
 # [decode]
 # workers = 0            # previews rendered at once (half of them for pre-generation); 0: one per CPU
 # ffmpeg = "/usr/bin/ffmpeg"  # HEIC, video posters and durations (ffprobe next to it); default: from PATH
-# gpu = "auto"           # decode HEIC, large JPEGs and video posters on the GPU (Intel Quick Sync, AMD) when one
-#                        # is found working at start (map /dev/dri into the container); "off": never
+# gpu = "off"            # "on": decode HEIC, large JPEGs and video posters on the GPU (Intel Quick Sync, AMD)
+#                        # when found working at start (map /dev/dri into the container); off unless set here
 # gpu_device = "/dev/dri/renderD128"
 # heic = "auto"          # HEIC through ffmpeg (GPU, else CPU; several times faster), libheif for what it cannot;
 #                        # "libheif": libheif only

@@ -105,8 +105,8 @@ pub struct DecodeConfig {
     /// The `wirephoto` binary the workers run (`<program> decode`). Default: the running one.
     #[serde(default)]
     pub program: Option<PathBuf>,
-    /// Decoding on the GPU: `auto` uses a VA-API GPU (Intel Quick Sync, AMD) on Linux when found working at
-    /// start; `on` also VideoToolbox on macOS (for development: there the CPU path is faster); `off` never.
+    /// Decoding on the GPU, off unless set here: `on` uses a VA-API GPU (Intel Quick Sync, AMD) on Linux, or
+    /// VideoToolbox on macOS, when found working at start; `off` (the default) never. (`auto` reads as `on`.)
     #[serde(default)]
     pub gpu: GpuMode,
     /// The GPU's render node (VA-API). Default: /dev/dri/renderD128.
@@ -121,9 +121,9 @@ pub struct DecodeConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuMode {
-    #[default]
-    Auto,
+    #[serde(alias = "auto")]
     On,
+    #[default]
     Off,
 }
 

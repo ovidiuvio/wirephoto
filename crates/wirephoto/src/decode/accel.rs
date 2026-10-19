@@ -337,13 +337,56 @@ pub(crate) fn heic(
     // session: setting those up costs far more than the decoding (measured on a Celeron NAS: ~8 s for a
     // grid, against ~2 s on the CPU). Grids are decoded on the CPU.
     if let Some(g) = gpu
-        && (l.tiles.len() > 1
-            || !(l.gpu_friendly() && if l.ten_bit() { g.hevc10 } else { g.hevc }))
+        && (l.tiles.len() > 1 || !(l.gpu_friendly() && if l.ten_bit() { g.hevc10 } else { g.hevc }))
     {
         return Ok(None);
     }
     let out = intermediate(l.width, l.height, target);
     let img = render(tools, gpu, &input, &[], &graph(&l, gpu.is_some(), out))?;
+    Ok(Some(Decoded {
+        img,
+        icc,
+        orientation,
+    }))
+}
+
+/// A HEIC grid decoded in one session: its tiles, read from the file, go to one decoder as the frames of a
+/// single HEVC stream, and ffmpeg's `tile` filter lays them out again. On the GPU (`gpu`) when it decodes their
+/// format; `None` when the file is not such a grid, or the GPU does not take it.
+pub fn heic_grid(
+    tools: &Tools,
+    gpu: Option<&Gpu>,
+    file: &[u8],
+    target: u32,
+    icc: Option<Vec<u8>>,
+    orientation: u8,
+) -> anyhow::Result<Option<Decoded>> {
+    let Some(g) = crate::media::heif::grid_stream(file) else {
+        return Ok(None);
+    };
+    let ten = g.bit_depth > 8;
+    if let Some(gpu) = gpu
+        && !(g.yuv420 && if ten { gpu.hevc10 } else { gpu.hevc })
+    {
+        return Ok(None);
+    }
+    let out = intermediate(g.width, g.height, target);
+    let (down, planar) = if ten {
+        ("p010le", "yuv420p10le")
+    } else {
+        ("nv12", "yuv420p")
+    };
+    let pre = if gpu.is_some() {
+        format!("hwdownload,format={down},format={planar},")
+    } else {
+        String::new()
+    };
+    let graph = format!(
+        "[0:0]{pre}tile=layout={}x{},crop={}:{}:0:0,scale={}:{}:flags=area,format=rgb24[out]",
+        g.cols, g.rows, g.width, g.height, out.0, out.1
+    );
+    let input = Input::Bytes(std::sync::Arc::new(g.stream));
+    let img = render(tools, gpu, &input, &["-f", "hevc"], &graph)?;
     Ok(Some(Decoded {
         img,
         icc,
@@ -456,6 +499,42 @@ mod tests {
                 heic(&tools, None, &src, 320, meta.icc, meta.orientation)
                     .unwrap()
                     .unwrap(),
+            );
+            assert_eq!((got.w, got.h), (want.w, want.h), "{name}");
+            let diff: u64 = got
+                .px
+                .iter()
+                .zip(&want.px)
+                .map(|(a, b)| a.abs_diff(*b) as u64)
+                .sum();
+            let mean = diff as f64 / got.px.len() as f64;
+            assert!(mean < 4.0, "{name}: mean difference {mean:.2}");
+        }
+    }
+
+    /// The tiles as one stream, laid out again by ffmpeg, against libheif's picture: every orientation.
+    #[cfg(feature = "heic")]
+    #[test]
+    fn grids_in_one_stream_match_libheif() {
+        use crate::preview::render::{self, Encoder};
+        let Some(tools) = Tools::find(None) else {
+            eprintln!("no ffmpeg: skipped");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heic");
+        for o in 1..=8 {
+            let name = format!("orientation-{o}.heic");
+            let bytes = std::fs::read(dir.join(&name)).unwrap();
+            let meta = render::heif_meta(&bytes).unwrap();
+            let pixels = |d: Decoded| {
+                let jpeg = render::finish(d, 320, Encoder::Turbo).unwrap();
+                render::decode_jpeg(&jpeg, 10_000).unwrap().img
+            };
+            let want = pixels(render::decode_heif(&bytes).unwrap());
+            let got = pixels(
+                heic_grid(&tools, None, &bytes, 320, meta.icc, meta.orientation)
+                    .unwrap()
+                    .expect("a grid"),
             );
             assert_eq!((got.w, got.h), (want.w, want.h), "{name}");
             let diff: u64 = got

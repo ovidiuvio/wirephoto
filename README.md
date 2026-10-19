@@ -9,8 +9,8 @@ browse, open, organise and save photos there.
   request.
 - **Every file type**: any file can be listed, downloaded, written, moved and trashed; previews for JPEG, PNG,
   GIF, WebP, TIFF, BMP, HEIC/HEIF/AVIF, camera RAW and video (a poster frame, with ffmpeg), decoded in sandboxed
-  worker processes. HEIC, large JPEGs and video posters decode on the GPU (Intel Quick Sync and other VA-API
-  GPUs) when one is mapped into the container.
+  worker processes. HEIC, large JPEGs and video posters can decode on the GPU (Intel Quick Sync and other
+  VA-API GPUs): off unless `[decode] gpu = "on"`.
 - **Safe with your files**: the folders on disk stay the truth; byte writes are version-checked and
   integrity-checked; deletes go to a trash.
 - **Small to run**: one container, one config file, one data folder.
