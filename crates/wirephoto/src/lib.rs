@@ -61,7 +61,18 @@ pub fn build(config: Config) -> anyhow::Result<(Arc<App>, axum::Router)> {
             None => tracing::warn!("ffmpeg/ffprobe not found: videos get no posters or durations"),
         }
         let (candidate, why_not) = gpu_candidate(&config.decode, tools.is_some());
-        let heic_ffmpeg = config.decode.heic == config::HeicMode::Auto && tools.is_some();
+        // HEIC through ffmpeg needs an ffprobe that lists tile grids (ffmpeg 7): asked once, here.
+        let heic_ffmpeg = config.decode.heic == config::HeicMode::Auto
+            && match &tools {
+                Some(t) if decode::accel::reads_tile_grids(t) => true,
+                Some(_) => {
+                    tracing::info!(
+                        "HEIC through libheif: this ffmpeg is older than 7.0 (no tile grids)"
+                    );
+                    false
+                }
+                None => false,
+            };
         let gpu = Arc::new(decode::GpuState::new(
             heic_ffmpeg,
             candidate.is_some(),

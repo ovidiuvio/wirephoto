@@ -155,6 +155,15 @@ fn first_line(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// Whether this ffprobe lists HEIF tile grids (`-show_stream_groups`, ffmpeg 7.0 and later), which HEIC through
+/// ffmpeg needs. Asked once, at start.
+pub fn reads_tile_grids(tools: &Tools) -> bool {
+    Command::new(&tools.ffprobe)
+        .args(["-hide_banner", "-help", "full"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("show_stream_groups"))
+}
+
 /// The size ffmpeg scales to before the usual resize: twice the target (or the image itself if smaller), so the
 /// last step is still the usual Lanczos one.
 fn intermediate(w: u32, h: u32, target: u32) -> (u32, u32) {
@@ -485,8 +494,8 @@ mod tests {
     #[test]
     fn same_pictures_as_libheif() {
         use crate::preview::render::{self, Encoder};
-        let Some(tools) = Tools::find(None) else {
-            eprintln!("no ffmpeg: skipped");
+        let Some(tools) = Tools::find(None).filter(reads_tile_grids) else {
+            eprintln!("no ffmpeg 7 or later: skipped");
             return;
         };
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heic");
