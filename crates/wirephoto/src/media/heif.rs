@@ -90,10 +90,8 @@ pub fn transforms(file_head: &[u8]) -> Option<Vec<Transform>> {
                     continue;
                 }
                 match props.get(index - 1) {
-                    Some((t, p)) if t == b"irot" => out.push(Transform::Rotate(p.first()? & 3)),
-                    Some((t, p)) if t == b"imir" => {
-                        out.push(Transform::Mirror(p.first()? & 1 == 1))
-                    }
+                    Some((b"irot", p)) => out.push(Transform::Rotate(p.first()? & 3)),
+                    Some((b"imir", p)) => out.push(Transform::Mirror(p.first()? & 1 == 1)),
                     _ => {}
                 }
             }
